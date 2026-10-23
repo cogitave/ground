@@ -6,6 +6,7 @@
 pub mod adapters;
 pub mod approval;
 pub mod config;
+pub mod lanes;
 pub mod ports;
 pub mod state;
 
