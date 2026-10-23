@@ -1,5 +1,9 @@
-//! The `ground` command. Replaced by the CLI implementation.
+//! The `ground` command.
 
-fn main() {
-    println!("usage: ground <command>\n\n(commands are not implemented yet)");
+use clap::Parser;
+
+#[tokio::main]
+async fn main() {
+    let cli = ground::cli::Cli::parse();
+    std::process::exit(ground::cli::run_cli(cli).await);
 }
