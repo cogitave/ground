@@ -389,3 +389,13 @@ async fn reads_the_token_from_gh_once_and_only_when_needed() {
             .contains("authorization: bearer fromgh")
     );
 }
+
+#[test]
+fn a_non_json_success_body_names_the_status_and_the_body() {
+    let err = decode_body(200, b"<html>gateway</html>")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("200") && err.contains("<html>"), "{err}");
+    assert_eq!(decode_body(502, b"<html>").unwrap(), Value::Null);
+    assert_eq!(decode_body(204, b"").unwrap(), Value::Null);
+}

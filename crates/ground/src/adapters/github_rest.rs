@@ -198,6 +198,24 @@ pub fn gh_merge_args(
     .collect()
 }
 
+/// The JSON body (`Null` when empty). A non-JSON body on a failure keeps its
+/// status (`check` reports it); on a success it is a protocol error naming both.
+fn decode_body(status: u16, bytes: &[u8]) -> PortResult<Value> {
+    if bytes.is_empty() {
+        return Ok(Value::Null);
+    }
+    match serde_json::from_slice(bytes) {
+        Ok(v) => Ok(v),
+        Err(_) if !(200..300).contains(&status) => Ok(Value::Null),
+        Err(_) => {
+            let head = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]);
+            Err(PortError::msg(format!(
+                "GitHub answered {status} with a body that is not JSON: {head}"
+            )))
+        }
+    }
+}
+
 // ---- the adapter ----
 
 pub struct RestGitHub<E: Exec = SystemExec> {
@@ -224,7 +242,7 @@ impl<E: Exec> RestGitHub<E> {
     /// `exec` runs `gh` for the token and for admin merges.
     pub fn with_exec(exec: E) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::adapters::http_client(),
             base: API.to_owned(),
             exec,
             token: OnceCell::new(),
@@ -294,11 +312,7 @@ impl<E: Exec> RestGitHub<E> {
         let res = req.send().await?;
         let status = res.status().as_u16();
         let bytes = res.bytes().await?;
-        let json = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-        };
+        let json = decode_body(status, &bytes)?;
         Ok((status, json))
     }
 

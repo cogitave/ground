@@ -7,17 +7,23 @@ pub trait Exec: Send + Sync {
     fn run(&self, cmd: &str, args: &[String]) -> impl Future<Output = PortResult<String>> + Send;
 }
 
+/// A hung `gh` must not hang a poll or a ship.
+const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Spawns the process for real.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemExec;
 
 impl Exec for SystemExec {
     async fn run(&self, cmd: &str, args: &[String]) -> PortResult<String> {
-        let out = tokio::process::Command::new(cmd)
+        let child = tokio::process::Command::new(cmd)
             .args(args)
             .stdin(std::process::Stdio::null())
-            .output()
+            .kill_on_drop(true)
+            .output();
+        let out = tokio::time::timeout(EXEC_TIMEOUT, child)
             .await
+            .map_err(|_| PortError::msg(format!("`{cmd}` did not finish within {EXEC_TIMEOUT:?}")))?
             .map_err(|e| PortError::msg(format!("cannot run `{cmd}`: {e}")))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);

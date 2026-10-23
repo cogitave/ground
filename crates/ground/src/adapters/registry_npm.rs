@@ -47,7 +47,7 @@ impl NpmRegistry {
 
     pub fn with_base_url(base: &str) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::adapters::http_client(),
             base: base.trim_end_matches('/').to_owned(),
         }
     }

@@ -12,3 +12,13 @@ pub use github_rest::{
     split_repo,
 };
 pub use registry_npm::{NpmRegistry, interpret_latest, parse_latest, registry_url};
+
+/// One HTTP client for both adapters: a stalled connection must fail a poll,
+/// not hang it (and the graceful stop waiting on it) forever.
+pub(crate) fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default()
+}

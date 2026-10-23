@@ -156,6 +156,23 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     set_mode(dir, 0o700)
 }
 
+/// Creates the database file already 0600, so it is never readable at the umask default.
+#[cfg(unix)]
+fn precreate_private(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .map(drop)
+}
+
+#[cfg(not(unix))]
+fn precreate_private(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -204,6 +221,9 @@ impl StateStore {
         let in_memory = path == Path::new(":memory:");
         if !in_memory && let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             create_private_dir(dir)?;
+        }
+        if !in_memory {
+            precreate_private(path)?;
         }
         let mut conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_millis(5000))?;
