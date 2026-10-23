@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdirSync } from 'node:fs'
+import { chmodSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -97,8 +97,17 @@ export class StateStore {
     private readonly clock: Clock,
     path: string = DEFAULT_DB_PATH,
   ) {
-    if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
-    this.db = new DatabaseSync(path)
+    if (path !== ':memory:') {
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
+      // A pre-existing directory keeps its old mode, so tighten it explicitly.
+      chmodSync(dirname(path), 0o700)
+    }
+    // groundd and `ground ship` open the same file from separate processes.
+    this.db = new DatabaseSync(path, { timeout: 5000 })
+    if (path !== ':memory:') {
+      this.db.exec('PRAGMA journal_mode=WAL')
+      chmodSync(path, 0o600)
+    }
     this.migrate()
   }
 
