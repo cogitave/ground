@@ -13,10 +13,10 @@ its "Hard rules" are invariants, not preferences.
 ## Build & Test
 
 ```bash
-pnpm typecheck
-pnpm lint
-pnpm test
-pnpm build
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+cargo build --release
 ```
 
 A test must not decide its outcome by racing real time. Time is the `Clock`

@@ -1,8 +1,9 @@
 # Rust port
 
-ground is written in Rust. M1 was first built in TypeScript (`src/`, 107 tests);
-that code is the behavioural reference until the Rust crate passes the same
-scenarios, and is removed afterwards.
+ground is written in Rust. M1 was first built in TypeScript (107 tests); the
+Rust crate reached parity with every one of those scenarios
+(`docs/rust-port-parity.md`) and the TypeScript code was then removed. Its
+history is in git before the commit that removed it.
 
 ## Layout
 

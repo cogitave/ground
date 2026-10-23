@@ -49,7 +49,7 @@ Problems 2-4 were fixed inside namzu's own workflows; incremental CI (below) rem
   produces the evidence a release trusts.
 - **Fail open.** If ground is down or the machine is off, every repository
   still works by hand exactly as it did before ground existed.
-- **Use maintained tools.** pnpm filters, vitest sharding, changesets, gh/octokit.
+- **Use maintained tools.** Each ecosystem's own filters and sharding (pnpm, vitest, cargo-nextest), changesets, gh.
   Custom code only where nothing maintained fits.
 
 ## Hard rules
@@ -176,9 +176,8 @@ what it would do.
 
 ### Stack
 
-TypeScript on Node 24 (ESM), pnpm, vitest, biome. SQLite through `node:sqlite`.
-GitHub through `@octokit/rest` with the token from `gh auth token`. No other
-runtime dependency without a reason written next to it.
+Rust (single static binary, no runtime dependency). See `docs/rust-port.md` for
+the crate layout and dependencies.
 
 ### Tests
 
