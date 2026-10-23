@@ -51,7 +51,6 @@ Problems 2-4 are fixed inside namzu's own workflows. ground owns the rest.
 ## Hard rules
 
 These are invariants, enforced in code and covered by tests.
-
 1. **No release trust.** ground never writes, signs, uploads or forges a
    validated-tree record or any artifact a release workflow reads as proof.
    Local results are advisory.
@@ -107,13 +106,13 @@ These are invariants, enforced in code and covered by tests.
 
 ## Lanes and milestones
 
-| Milestone | Lane | Delivers |
-|---|---|---|
-| M1 | release | CLI + daemon skeleton, state, GitHub port, `ground ship` end to end (dry-run by default) |
-| M2 | trunk | postsubmit of main's tip in a local worktree; bisect over green-on-PR commits; revert PR |
-| M3 | pre-flight | `ground check`: affected packages + the repo's gates locally, for agents before push |
-| M4 | classify | version-only classifier; CI-side pieces vendored into consumer repos by a reviewed sync PR |
-| M5 | adapters | bun and cargo adapters; onboard namzu-web |
+| Milestone | Lane       | Delivers                                                                                   |
+| --------- | ---------- | ------------------------------------------------------------------------------------------ |
+| M1        | release    | CLI + daemon skeleton, state, GitHub port, `ground ship` end to end (dry-run by default)   |
+| M2        | trunk      | postsubmit of main's tip in a local worktree; bisect over green-on-PR commits; revert PR   |
+| M3        | pre-flight | `ground check`: affected packages + the repo's gates locally, for agents before push       |
+| M4        | classify   | version-only classifier; CI-side pieces vendored into consumer repos by a reviewed sync PR |
+| M5        | adapters   | bun and cargo adapters; onboard namzu-web                                                  |
 
 The namzu-internal CI fixes (problems 2-4) run in parallel in namzu itself.
 
@@ -124,7 +123,6 @@ The namzu-internal CI fixes (problems 2-4) run in parallel in namzu itself.
 Each step is idempotent and persisted, so `ground ship` can be interrupted and
 re-run. Without `--confirm` it stops before the first GitHub write and prints
 what it would do.
-
 1. **Find the version PR**: open PR from `releaseBranch` (namzu:
    `changeset-release/main`) into the default branch. If none: when the default
    branch has pending changesets and a release run is in progress, wait for it
