@@ -4,8 +4,10 @@ Instructions for AI agents working in this repository. `CLAUDE.md` imports this 
 
 ## Project
 
-ground is a local service that drives merge, trunk validation and release for
-cogitave's repositories. Read `docs/design.md` before any non-trivial change;
+ground is a general-purpose delivery service for any GitHub repository: merge,
+trunk validation, incremental CI and release, run locally by whoever uses it.
+Nothing in it may assume a particular organisation or project; namzu is only the
+first adopter. Read `docs/design.md` before any non-trivial change;
 its "Hard rules" are invariants, not preferences.
 
 ## Build & Test

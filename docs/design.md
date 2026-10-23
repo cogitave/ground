@@ -1,15 +1,19 @@
 # ground — design
 
-ground is a local service that drives merge, trunk validation and release for
-cogitave's repositories. It runs on the owner's machine, watches GitHub, and
-does the waiting, approving, re-running, bisecting and confirming that a person
-otherwise babysits by hand.
+ground is a general-purpose delivery service for any repository on GitHub:
+merge, trunk validation, incremental CI and release at the pace of AI coding
+agents. Anyone runs it on their own machine (or a server they own); it watches
+their repositories and does the waiting, approving, re-running, bisecting and
+confirming that a person otherwise babysits by hand, and it keeps CI from
+re-testing what did not change.
 
-It exists because at 6-9 agent-authored merges a day, `namzu`'s path from
-merge to npm took 90-120 minutes and needed someone at every step. The measured
-causes are in "Why" below; every component here answers one of them.
+It is not tied to any one project or organisation. Its first adopter, and the
+case study that shaped it, is `namzu`: at 6-9 agent-authored merges a day,
+namzu's path from merge to npm took 90-120 minutes and needed someone at every
+step. Those measured causes are below; every component answers one of them,
+and each generalises to any repository with the same shape.
 
-## Why (measured on namzu, 2026-10-23)
+## Why (case study: namzu, measured 2026-10-23)
 
 1. Version-PR CI: 9 of 9 first-attempt runs whose actor was
    `github-actions[bot]` stopped at `action_required` (repo approval policy
@@ -28,7 +32,7 @@ causes are in "Why" below; every component here answers one of them.
 8. 7 of 34 CI runs failed in 3 days, some of them flakes; a failed job leaves
    no validation record.
 
-Problems 2-4 are fixed inside namzu's own workflows. ground owns the rest.
+Problems 2-4 were fixed inside namzu's own workflows; incremental CI (below) removes their class for every adopter. ground owns the rest.
 
 ## Principles
 
@@ -96,8 +100,8 @@ These are invariants, enforced in code and covered by tests.
   SQLite so a restart resumes where it stopped.
 - **GitHub client**: one interface (`GitHubPort`) so every lane is tested
   against a fake. Conditional requests (ETag) keep polling inside rate limits.
-- **Ecosystem adapters**: `pnpm-changesets` first (namzu), then `bun`
-  (namzu-web) and `cargo` (yuva). An adapter knows how to list packages,
+- **Ecosystem adapters**: `pnpm-changesets` first, then `cargo`, `bun`, `npm`,
+  `yarn`, `uv` and `go`. An adapter knows how to list packages,
   compute affected packages, run gates locally, and which packages a version
   PR bumps.
 - **Repository config**: `~/.ground/repos/<owner>__<repo>.json`, owned by the
@@ -112,9 +116,9 @@ These are invariants, enforced in code and covered by tests.
 | M2        | trunk      | postsubmit of main's tip in a local worktree; bisect over green-on-PR commits; revert PR   |
 | M3        | pre-flight | `ground check`: affected packages + the repo's gates locally, for agents before push       |
 | M4        | classify   | version-only classifier; CI-side pieces vendored into consumer repos by a reviewed sync PR |
-| M5        | adapters   | bun and cargo adapters; onboard namzu-web                                                  |
+| M5        | adapters   | cargo, bun, npm/yarn, uv, go adapters; public install (binaries, npm wrapper, cargo)       |
 
-The namzu-internal CI fixes (problems 2-4) run in parallel in namzu itself.
+namzu adopts each milestone as it lands; its internal CI fixes (problems 2-4) run in parallel in namzu itself.
 
 ## M1 specification
 
