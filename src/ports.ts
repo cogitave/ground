@@ -17,6 +17,8 @@ export interface PullRequest {
   title: string
   state: 'open' | 'closed'
   merged: boolean
+  /** Set once the PR is merged; GitHub's merge_commit_sha. */
+  mergeCommitSha?: string
   headRef: string
   headSha: string
   headRepo: RepoSlug

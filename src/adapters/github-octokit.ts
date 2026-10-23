@@ -29,6 +29,7 @@ export interface RawPr {
   state: string
   merged?: boolean
   merged_at?: string | null
+  merge_commit_sha?: string | null
   head: { ref: string; sha: string; repo: { full_name: string } | null }
   base: { ref: string; sha: string }
   user: { login: string } | null
@@ -42,6 +43,7 @@ export function mapPr(raw: RawPr): PullRequest {
     title: raw.title,
     state: raw.state === 'open' ? 'open' : 'closed',
     merged,
+    ...(merged && raw.merge_commit_sha ? { mergeCommitSha: raw.merge_commit_sha } : {}),
     headRef: raw.head.ref,
     headSha: raw.head.sha,
     // A deleted fork has no repo; an empty-owner slug can never match the base repo.

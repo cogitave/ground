@@ -215,7 +215,7 @@ export class FakeGitHub implements GitHubPort {
       )
     }
     const mergeCommitSha = this.mergeShas.get(`${repo}#${number}`) ?? `merge-commit-${number}`
-    const merged = { ...pr, state: 'closed' as const, merged: true }
+    const merged = { ...pr, state: 'closed' as const, merged: true, mergeCommitSha }
     this.prs.set(`${repo}#${number}`, merged)
     this.branches.set(`${repo}@${pr.baseRef}`, mergeCommitSha)
     this.onMerge?.(merged, mergeCommitSha)
