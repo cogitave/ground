@@ -40,8 +40,8 @@ The crates.io name `ground` belongs to another project, so the package is
 - `clap` (derive) for the CLI, `serde`/`serde_json` for config and the socket
   protocol, `thiserror` for library errors, `anyhow` only in the binaries,
   `tracing` for logs.
-- Every dependency is maintained and MIT/Apache-2.0 compatible; `cargo deny`
-  checks licences in CI.
+- Every dependency is maintained and MIT/Apache-2.0 compatible (checked by
+  hand when added; an automated `cargo deny` gate is not wired yet).
 
 ## Gates
 

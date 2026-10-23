@@ -30,6 +30,8 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --all-features
+      - name: Release build
+        run: cargo build --release
 
   # The TypeScript M1 stays the behavioural reference until the Rust crate
   # passes the same scenarios; these gates go when src/ goes.
