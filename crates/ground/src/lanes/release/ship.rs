@@ -11,8 +11,8 @@ use super::types::{
 };
 use crate::approval::{ApprovalDecision, can_approve_run};
 use crate::ports::{
-    Clock, GitHubPort, Logger, MergeOptions, PrFileStatus, PrState, PullRequest, RegistryPort,
-    RunFilter, WorkflowRun,
+    Clock, GitHubPort, Logger, MergeOptions, PortError, PrFileStatus, PrState, PullRequest,
+    RegistryPort, RunFilter, WorkflowRun,
 };
 use crate::state::{NewShipSession, ShipSessionPatch};
 
@@ -149,6 +149,22 @@ where
     ShipRun::start(*deps, options.clone())?.run().await
 }
 
+/// How a version PR differs from the changesets on the default branch.
+struct Stale {
+    missing: Vec<String>,
+    extra: Vec<String>,
+}
+
+impl Stale {
+    fn describe(&self, default_branch: &str) -> String {
+        format!(
+            "not deleted by the PR: [{}]; deleted but not on {default_branch}: [{}]",
+            self.missing.join(", "),
+            self.extra.join(", ")
+        )
+    }
+}
+
 enum CiVerdict {
     Green,
     Restart,
@@ -240,7 +256,8 @@ where
         let mut saw_running = false;
         let mut grace = false;
         let found = loop {
-            if let Some(found) = self.find_pr_probe(&mut saw_running, &mut grace).await? {
+            let probe = self.find_pr_probe(&mut saw_running, &mut grace).await;
+            if let Some(found) = self.answered(probe)? {
                 break Some(found);
             }
             if self.pause(deadline).await {
@@ -319,7 +336,8 @@ where
         let deadline = self.begin_wait("snapshot", wait)?;
         let mut diff = String::new();
         let res = loop {
-            if let Some(pr) = self.snapshot_probe(&mut diff).await? {
+            let probe = self.snapshot_probe(&mut diff).await;
+            if let Some(pr) = self.answered(probe)? {
                 break Some(pr);
             }
             if self.pause(deadline).await {
@@ -352,6 +370,26 @@ where
         else {
             return Ok(None);
         };
+        match self.stale_changesets(&pr).await? {
+            None => Ok(Some(pr)),
+            Some(stale) => {
+                *diff = stale.describe(&cfg.default_branch);
+                self.deps.logger.info(
+                    "version PR is stale, waiting for the release run to refresh it",
+                    Some(json!({ "missing": stale.missing, "extra": stale.extra })),
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// The one snapshot comparison (a version PR is a snapshot: it must delete exactly the
+    /// changesets on the default branch now). `None` when it does, else how it differs.
+    /// Used by the snapshot wait and again right before the merge, because a changeset can
+    /// land between the two.
+    async fn stale_changesets(&self, pr: &PullRequest) -> Result<Option<Stale>> {
+        let cfg = self.cfg();
+        let github = self.deps.github;
         let on_branch = changeset_names(
             github
                 .list_dir(&cfg.repo, &cfg.default_branch, ".changeset")
@@ -367,20 +405,7 @@ where
         );
         let missing: Vec<String> = on_branch.difference(&deleted).cloned().collect();
         let extra: Vec<String> = deleted.difference(&on_branch).cloned().collect();
-        if missing.is_empty() && extra.is_empty() {
-            return Ok(Some(pr));
-        }
-        *diff = format!(
-            "not deleted by the PR: [{}]; deleted but not on {}: [{}]",
-            missing.join(", "),
-            cfg.default_branch,
-            extra.join(", ")
-        );
-        self.deps.logger.info(
-            "version PR is stale, waiting for the release run to refresh it",
-            Some(json!({ "missing": missing, "extra": extra })),
-        );
-        Ok(None)
+        Ok((!missing.is_empty() || !extra.is_empty()).then_some(Stale { missing, extra }))
     }
 
     // ---- steps 3 and 4 ----
@@ -393,7 +418,8 @@ where
         let wait = self.opts.ci_wait_minutes.unwrap_or(120);
         let deadline = self.begin_wait("ci", wait)?;
         let verdict = loop {
-            if let Some(v) = self.ci_probe(pr_number, &mut blocked_by).await? {
+            let probe = self.ci_probe(pr_number, &mut blocked_by).await;
+            if let Some(v) = self.answered(probe)? {
                 break Some(v);
             }
             if self.pause(deadline).await {
@@ -525,7 +551,10 @@ where
             if !self.opts.confirm {
                 return Ok(Some(CiVerdict::Plan(plan)));
             }
-            github.approve_run(repo, run.id).await?;
+            github
+                .approve_run(repo, run.id)
+                .await
+                .map_err(PortError::into_permanent)?;
             self.deps.store.record_event(
                 repo,
                 "ship.approve",
@@ -571,7 +600,10 @@ where
         if !self.opts.confirm {
             return Ok(Some(CiVerdict::Plan(plan)));
         }
-        github.rerun_failed_jobs(repo, run.id).await?;
+        github
+            .rerun_failed_jobs(repo, run.id)
+            .await
+            .map_err(PortError::into_permanent)?;
         self.rerun_requested.insert(run.id, run.run_attempt);
         for job in &names {
             self.deps
@@ -640,6 +672,16 @@ where
             ));
         }
 
+        // A changeset may have landed since the snapshot step (a dry run persists "merge"),
+        // and a PR that does not delete it publishes nothing. Go back and wait for a refresh.
+        if let Some(stale) = self.stale_changesets(&pr).await? {
+            self.deps.logger.info(
+                "version PR went stale before the merge, back to the snapshot check",
+                Some(json!({ "missing": stale.missing, "extra": stale.extra })),
+            );
+            return Ok(StepResult::Next(Step::Snapshot));
+        }
+
         let scan = scan_bumps(&github.list_pr_files(repo, pr_number).await?);
         let base_was_tip = github.get_branch_sha(repo, &cfg.default_branch).await? == pr.base_sha;
         let how = format!(
@@ -692,7 +734,8 @@ where
                     expected_head_sha: head_sha,
                 },
             )
-            .await?;
+            .await
+            .map_err(PortError::into_permanent)?;
         self.data.merge_commit_sha = Some(merged.merge_commit_sha.clone());
         self.save(Some(Step::Release), None)?;
         self.deps.store.record_event(
@@ -725,7 +768,8 @@ where
         let deadline = self.begin_wait("release", wait)?;
         let mut attempt_seen = 1;
         let verdict = loop {
-            if let Some(v) = self.release_probe(&sha, &mut attempt_seen).await? {
+            let probe = self.release_probe(&sha, &mut attempt_seen).await;
+            if let Some(v) = self.answered(probe)? {
                 break Some(v);
             }
             if self.pause(deadline).await {
@@ -813,7 +857,10 @@ where
         if run.run_attempt.saturating_sub(1) >= RELEASE_RERUNS {
             return Ok(Some(Some((run, jobs))));
         }
-        github.rerun_failed_jobs(repo, run.id).await?;
+        github
+            .rerun_failed_jobs(repo, run.id)
+            .await
+            .map_err(PortError::into_permanent)?;
         self.rerun_requested.insert(run.id, run.run_attempt);
         for job in &jobs {
             self.deps
@@ -850,9 +897,14 @@ where
             let confirmed = loop {
                 let mut still = Vec::new();
                 for pkg in std::mem::take(&mut missing) {
-                    let latest = self.deps.registry.latest_version(&pkg.name).await?;
-                    if latest.as_deref() != Some(pkg.to.as_str()) {
-                        still.push(pkg);
+                    match self.deps.registry.latest_version(&pkg.name).await {
+                        Ok(latest) if latest.as_deref() == Some(pkg.to.as_str()) => {}
+                        Ok(_) => still.push(pkg),
+                        // An unanswered poll, like a package the registry does not show yet.
+                        Err(e) => {
+                            self.survive(e.into())?;
+                            still.push(pkg);
+                        }
                     }
                 }
                 missing = still;
@@ -931,17 +983,23 @@ where
     /// deadline. The deadline is persisted, and cleared by `end_wait` so the next wait starts
     /// fresh. A malformed stored deadline never expires.
     fn begin_wait(&mut self, key: &str, minutes: u64) -> Result<Option<DateTime<Utc>>> {
-        if !self.data.deadlines.contains_key(key) {
-            let at = self.deps.clock.now() + Duration::minutes(minutes as i64);
-            self.data.deadlines.insert(
-                key.to_owned(),
-                at.to_rfc3339_opts(SecondsFormat::Millis, true),
-            );
-            self.save(None, None)?;
+        let parsed = self
+            .data
+            .deadlines
+            .get(key)
+            .and_then(|d| DateTime::parse_from_rfc3339(d).ok())
+            .map(|d| d.with_timezone(&Utc));
+        if let Some(deadline) = parsed {
+            return Ok(Some(deadline));
         }
-        Ok(DateTime::parse_from_rfc3339(&self.data.deadlines[key])
-            .ok()
-            .map(|d| d.with_timezone(&Utc)))
+        // Missing, or unreadable (so a wait could never end): start a fresh budget.
+        let at = self.deps.clock.now() + Duration::minutes(minutes as i64);
+        self.data.deadlines.insert(
+            key.to_owned(),
+            at.to_rfc3339_opts(SecondsFormat::Millis, true),
+        );
+        self.save(None, None)?;
+        Ok(Some(at))
     }
 
     fn end_wait(&mut self, key: &str) -> Result<()> {
@@ -957,6 +1015,29 @@ where
         }
         self.deps.clock.sleep(self.cfg().poll_seconds * 1000).await;
         false
+    }
+
+    /// A probe's result as a poll: a transient read failure is an unanswered poll
+    /// (`Ok(None)`, so the step's wait budget bounds it); anything else propagates.
+    fn answered<T>(&self, probe: Result<Option<T>>) -> Result<Option<T>> {
+        match probe {
+            Err(e) => self.survive(e).map(|()| None),
+            ok => ok,
+        }
+    }
+
+    /// `Ok` (after a warning) for a transient read failure, the error itself otherwise.
+    fn survive(&self, err: ShipError) -> Result<()> {
+        match err {
+            ShipError::Port(e) if e.is_transient() => {
+                self.deps.logger.warn(
+                    "a read failed, treating the poll as unanswered",
+                    Some(json!({ "error": e.to_string() })),
+                );
+                Ok(())
+            }
+            other => Err(other),
+        }
     }
 
     fn reruns(&self) -> u32 {

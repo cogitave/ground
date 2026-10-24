@@ -36,6 +36,11 @@ The crates.io name `ground` belongs to another project, so the package is
 - `reqwest` (rustls) for the ~11 GitHub REST endpoints ground needs, instead of
   a full SDK. Admin merge shells out to `gh pr merge --admin --match-head-commit`
   because ruleset bypass is proven to work through `gh`.
+- Errors from the ports distinguish `PortError::Transient` (a failed GET at the
+  transport level, or a GET answered 5xx/429; its message carries the
+  `source()` chain) from permanent ones. Only the adapters, which know the
+  method, produce it, and never for a write. The ship wait loops treat it as an
+  unanswered poll.
 - `rusqlite` with the `bundled` feature: no system SQLite dependency. Busy
   timeout 5 s, WAL, directory 0700, database file 0600.
 - `clap` (derive) for the CLI, `serde`/`serde_json` for config and the socket

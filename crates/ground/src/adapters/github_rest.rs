@@ -216,6 +216,12 @@ fn decode_body(status: u16, bytes: &[u8]) -> PortResult<Value> {
     }
 }
 
+/// Only a GET is a read. Any other method may have taken effect even when the
+/// request failed in transit, so its failures are never transient.
+fn is_read(method: &Method) -> bool {
+    method == Method::GET
+}
+
 // ---- the adapter ----
 
 pub struct RestGitHub<E: Exec = SystemExec> {
@@ -298,6 +304,7 @@ impl<E: Exec> RestGitHub<E> {
         body: Option<Value>,
     ) -> PortResult<(u16, Value)> {
         let token = self.token().await?;
+        let read = is_read(&method);
         let mut req = self
             .client
             .request(method, url)
@@ -309,25 +316,31 @@ impl<E: Exec> RestGitHub<E> {
         if let Some(body) = body {
             req = req.json(&body);
         }
-        let res = req.send().await?;
+        let res = req
+            .send()
+            .await
+            .map_err(|e| PortError::from_transport(read, &e))?;
         let status = res.status().as_u16();
-        let bytes = res.bytes().await?;
+        let bytes = res
+            .bytes()
+            .await
+            .map_err(|e| PortError::from_transport(read, &e))?;
         let json = decode_body(status, &bytes)?;
         Ok((status, json))
     }
 
-    fn check(status: u16, body: &Value) -> PortResult<()> {
+    fn check(method: &Method, status: u16, body: &Value) -> PortResult<()> {
         if (200..300).contains(&status) {
             return Ok(());
         }
-        Err(PortError::Http {
-            service: "GitHub".into(),
+        Err(PortError::from_http(
+            is_read(method),
+            "GitHub",
             status,
-            detail: body
-                .get("message")
+            body.get("message")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-        })
+        ))
     }
 
     async fn request(
@@ -337,8 +350,8 @@ impl<E: Exec> RestGitHub<E> {
         query: &[(&str, String)],
         body: Option<Value>,
     ) -> PortResult<Value> {
-        let (status, json) = self.send(method, url, query, body).await?;
-        Self::check(status, &json)?;
+        let (status, json) = self.send(method.clone(), url, query, body).await?;
+        Self::check(&method, status, &json)?;
         Ok(json)
     }
 
@@ -424,7 +437,7 @@ impl<E: Exec> GitHubPort for RestGitHub<E> {
         if status == 404 {
             return Ok(Vec::new());
         }
-        Self::check(status, &body)?;
+        Self::check(&Method::GET, status, &body)?;
         Ok(match body {
             Value::Array(entries) => entries
                 .iter()

@@ -7,10 +7,10 @@ use tokio::sync::Notify;
 use super::{ShipDeps, ShipError, ShipOptions, ShipOutcome, ShipPlanAction, ShipStatus, ship};
 use crate::config::RepoConfig;
 use crate::ports::{
-    Clock, GitHubPort, MergeMethod, MergeOptions, MergeResult, PortResult, PrFile, PrFileStatus,
-    PrState, PullRequest, RunFilter, RunJob, WorkflowRun,
+    Clock, GitHubPort, MergeMethod, MergeOptions, MergeResult, PortError, PortResult, PrFile,
+    PrFileStatus, PrState, PullRequest, RunFilter, RunJob, WorkflowRun,
 };
-use crate::state::StateStore;
+use crate::state::{ShipSessionPatch, StateStore};
 use crate::testing::{
     FakeClock, FakeGitHub, FakeRegistry, MemoryLogger, RunScript, RunStage, WriteMethod, make_pr,
     make_run,
@@ -95,19 +95,69 @@ struct Port {
     move_to: Option<String>,
     lagging: bool,
     lag: Mutex<Lag>,
+    faults: Mutex<Faults>,
+}
+
+#[derive(Clone, Copy)]
+enum Fault {
+    /// `PortError::Transient`.
+    Transient,
+    /// `PortError::Http` 404.
+    NotFound,
+    /// `PortError::Message`.
+    Message,
+}
+
+#[derive(Default)]
+struct Faults {
+    /// Operation name to (failures left, kind). `u32::MAX` is an outage that never ends.
+    pending: std::collections::HashMap<&'static str, (u32, Fault)>,
+    calls: std::collections::HashMap<&'static str, u32>,
+    /// Once a re-run succeeds, this operation starts failing: a read right after the write.
+    after_rerun: Option<(&'static str, u32, Fault)>,
+    /// The same, for an approval.
+    after_approve: Option<(&'static str, u32, Fault)>,
+}
+
+impl Port {
+    /// Counts the call and fails it while this operation has failures scripted.
+    fn trip(&self, op: &'static str) -> PortResult<()> {
+        let mut faults = self.faults.lock().unwrap();
+        *faults.calls.entry(op).or_default() += 1;
+        let Some((left, kind)) = faults.pending.get_mut(op) else {
+            return Ok(());
+        };
+        if *left == 0 {
+            return Ok(());
+        }
+        *left -= 1;
+        Err(match kind {
+            Fault::Transient => PortError::Transient(format!("{op} fell over")),
+            Fault::NotFound => PortError::Http {
+                service: "GitHub".into(),
+                status: 404,
+                detail: Some(format!("{op} missing")),
+            },
+            Fault::Message => PortError::msg(format!("{op} broke")),
+        })
+    }
 }
 
 impl GitHubPort for Port {
     async fn find_open_pr(&self, r: &str, h: &str, b: &str) -> PortResult<Option<PullRequest>> {
+        self.trip("find_open_pr")?;
         self.inner.find_open_pr(r, h, b).await
     }
     async fn get_pr(&self, r: &str, n: u64) -> PortResult<PullRequest> {
+        self.trip("get_pr")?;
         self.inner.get_pr(r, n).await
     }
     async fn list_pr_files(&self, r: &str, n: u64) -> PortResult<Vec<PrFile>> {
+        self.trip("list_pr_files")?;
         self.inner.list_pr_files(r, n).await
     }
     async fn list_dir(&self, r: &str, g: &str, p: &str) -> PortResult<Vec<String>> {
+        self.trip("list_dir")?;
         self.inner.list_dir(r, g, p).await
     }
     async fn get_branch_sha(&self, r: &str, b: &str) -> PortResult<String> {
@@ -119,6 +169,11 @@ impl GitHubPort for Port {
         wf: &str,
         filter: &RunFilter,
     ) -> PortResult<Vec<WorkflowRun>> {
+        self.trip(if wf == "ci.yml" {
+            "runs:ci"
+        } else {
+            "runs:release"
+        })?;
         if self.lagging && wf == "ci.yml" {
             let stale = {
                 let mut lag = self.lag.lock().unwrap();
@@ -144,12 +199,20 @@ impl GitHubPort for Port {
         Ok(runs)
     }
     async fn list_run_jobs(&self, r: &str, id: u64) -> PortResult<Vec<RunJob>> {
+        self.trip("list_run_jobs")?;
         self.inner.list_run_jobs(r, id).await
     }
     async fn approve_run(&self, r: &str, id: u64) -> PortResult<()> {
-        self.inner.approve_run(r, id).await
+        self.trip("approve_run")?;
+        self.inner.approve_run(r, id).await?;
+        let mut faults = self.faults.lock().unwrap();
+        if let Some((op, n, kind)) = faults.after_approve.take() {
+            faults.pending.insert(op, (n, kind));
+        }
+        Ok(())
     }
     async fn rerun_failed_jobs(&self, r: &str, id: u64) -> PortResult<()> {
+        self.trip("rerun_failed_jobs")?;
         if self.lagging {
             let stale = self
                 .inner
@@ -158,6 +221,12 @@ impl GitHubPort for Port {
             self.lag.lock().unwrap().stale = Some(stale);
         }
         self.inner.rerun_failed_jobs(r, id).await?;
+        {
+            let mut faults = self.faults.lock().unwrap();
+            if let Some((op, n, kind)) = faults.after_rerun.take() {
+                faults.pending.insert(op, (n, kind));
+            }
+        }
         self.lag.lock().unwrap().pending = true;
         Ok(())
     }
@@ -312,6 +381,7 @@ impl World {
             move_to: b.move_to,
             lagging: b.lagging,
             lag: Mutex::new(Lag::default()),
+            faults: Mutex::new(Faults::default()),
         };
         Self {
             config,
@@ -379,6 +449,35 @@ impl World {
 
     fn active(&self) -> Option<crate::state::ShipSession> {
         self.store.get_active_ship_session(REPO).unwrap()
+    }
+
+    /// The next `n` calls of `op` fail with `kind`.
+    fn fail(&self, op: &'static str, n: u32, kind: Fault) {
+        self.port
+            .faults
+            .lock()
+            .unwrap()
+            .pending
+            .insert(op, (n, kind));
+    }
+
+    fn calls(&self, op: &'static str) -> u32 {
+        self.port
+            .faults
+            .lock()
+            .unwrap()
+            .calls
+            .get(op)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn warned(&self) -> usize {
+        self.logger
+            .messages(Some(crate::ports::LogLevel::Warn))
+            .iter()
+            .filter(|m| m.contains("unanswered"))
+            .count()
     }
 
     fn writes(&self, m: WriteMethod) -> usize {
@@ -880,4 +979,320 @@ async fn outcome_serialises_with_camel_case_keys() {
     assert_eq!(v["status"], "planned");
     assert_eq!(v["prNumber"], json!(1));
     assert!(v.get("sessionId").is_some());
+}
+
+// ---- a transient read failure is an unanswered poll, not the end of the ship ----
+
+/// A release run that is already green when the merge lands.
+fn release_lands_green(w: &World) {
+    let (g2, r2) = (w.gh.clone(), w.registry.clone());
+    w.gh.on_merge(move |_pr, sha| {
+        r2.set_version("@namzu/sdk", "1.1.0");
+        g2.add_run(
+            REPO,
+            release_run(sha, |r| {
+                r.status = "completed".into();
+                r.conclusion = Some("success".into());
+            }),
+            RunScript::default(),
+        );
+    });
+}
+
+#[tokio::test]
+async fn survives_transient_failures_reading_the_release_run_and_still_ships() {
+    let w = World::new();
+    w.gh.add_run(REPO, make_run(|_| {}), stages(green(1)));
+    release_lands_green(&w);
+    w.fail("runs:release", 3, Fault::Transient);
+    let out = w.go().await;
+    assert_eq!(out.status, ShipStatus::Shipped);
+    assert_eq!(w.warned(), 3);
+    assert_eq!(w.writes(WriteMethod::MergePr), 1);
+}
+
+#[tokio::test]
+async fn survives_a_transient_registry_failure_and_still_confirms_the_publish() {
+    let w = World::new();
+    w.gh.add_run(REPO, make_run(|_| {}), stages(green(1)));
+    w.registry.fail_queries(2, true);
+    let out = w.go().await;
+    assert_eq!(out.status, ShipStatus::Shipped);
+    assert_eq!(w.warned(), 2);
+    assert_eq!(w.registry.queries().len(), 3);
+}
+
+#[tokio::test]
+async fn survives_a_transient_failure_in_the_ci_gate() {
+    let w = World::new();
+    w.gh.add_run(REPO, make_run(|_| {}), stages(green(1)));
+    w.fail("runs:ci", 2, Fault::Transient);
+    let out = w.go().await;
+    assert_eq!(out.status, ShipStatus::Shipped);
+    assert_eq!(w.warned(), 2);
+}
+
+#[tokio::test]
+async fn survives_a_transient_failure_in_the_snapshot_check() {
+    let w = World::new();
+    w.gh.add_run(REPO, make_run(|_| {}), stages(green(1)));
+    w.fail("list_pr_files", 1, Fault::Transient);
+    let out = w.go().await;
+    assert_eq!(out.status, ShipStatus::Shipped);
+    assert_eq!(w.warned(), 1);
+}
+
+#[tokio::test]
+async fn survives_a_transient_failure_while_finding_the_version_pr() {
+    let w = World::new();
+    w.gh.add_run(REPO, make_run(|_| {}), stages(green(1)));
+    w.fail("find_open_pr", 2, Fault::Transient);
+    let out = w.go().await;
+    assert_eq!(out.status, ShipStatus::Shipped);
+    assert_eq!(w.warned(), 2);
+}
+
+#[tokio::test]
+async fn a_transient_outage_longer_than_the_step_budget_times_out_instead_of_erroring() {
+    // find_pr / snapshot share the version PR budget.
+    let w = World::with_config(|c| c.version_pr_wait_minutes = 2);
+    w.fail("find_open_pr", u32::MAX, Fault::Transient);
+    let out = w.go().await;
+    assert_eq!(out.status, ShipStatus::TimedOut);
+    assert!(w.active().is_some());
+
+    // The CI gate.
+    let w = World::new();
+    w.gh.add_run(REPO, make_run(|_| {}), stages(green(1)));
+    w.fail("runs:ci", u32::MAX, Fault::Transient);
+    let out = w.go_ci_wait(2).await;
+    assert_eq!(out.status, ShipStatus::TimedOut);
+    assert_eq!(w.active().unwrap().step, "gate");
+    assert!(w.gh.writes().is_empty());
+
+    // The release run: merged, then an outage; resumable.
+    let w = World::new();
+    w.gh.add_run(REPO, make_run(|_| {}), stages(green(1)));
+    release_lands_green(&w);
+    w.fail("runs:release", u32::MAX, Fault::Transient);
+    let out = w.go().await;
+    assert_eq!(out.status, ShipStatus::TimedOut);
+    assert_eq!(w.writes(WriteMethod::MergePr), 1);
+    assert_eq!(w.active().unwrap().step, "release");
+
+    // The registry.
+    let w = World::new();
+    w.gh.add_run(REPO, make_run(|_| {}), stages(green(1)));
+    w.registry.fail_queries(u32::MAX, true);
+    let out = w.go().await;
+    assert_eq!(out.status, ShipStatus::RegistryPending);
+    assert!(w.active().is_some());
+}
+
+#[tokio::test]
+async fn a_permanent_read_error_still_propagates() {
+    for (op, kind) in [
+        ("runs:release", Fault::NotFound),
+        ("runs:ci", Fault::Message),
+        ("find_open_pr", Fault::NotFound),
+        ("list_dir", Fault::Message),
+    ] {
+        let w = World::new();
+        w.gh.add_run(REPO, make_run(|_| {}), stages(green(1)));
+        release_lands_green(&w);
+        w.fail(op, u32::MAX, kind);
+        let err = w.run_with(&w.clock, confirm()).await.unwrap_err();
+        let ShipError::Port(e) = err else {
+            panic!("{op}: not a port error")
+        };
+        assert!(!e.is_transient(), "{op}");
+        assert_eq!(w.warned(), 0, "{op}");
+    }
+    let w = World::new();
+    w.gh.add_run(REPO, make_run(|_| {}), stages(green(1)));
+    w.registry.fail_queries(1, false);
+    assert!(w.run_with(&w.clock, confirm()).await.is_err());
+}
+
+fn confirm() -> ShipOptions {
+    ShipOptions {
+        confirm: true,
+        ..ShipOptions::default()
+    }
+}
+
+#[tokio::test]
+async fn a_failed_write_is_never_retried_whatever_its_kind() {
+    for kind in [Fault::Message, Fault::Transient, Fault::NotFound] {
+        // CI re-run.
+        let w = World::new();
+        w.gh.add_run(REPO, run_with("completed", "failure"), on_rerun(green(0)));
+        w.fail("rerun_failed_jobs", u32::MAX, kind);
+        let err = w.run_with(&w.clock, confirm()).await.unwrap_err();
+        assert!(
+            matches!(&err, ShipError::Port(e) if !e.is_transient()),
+            "{err}"
+        );
+        assert_eq!(w.calls("rerun_failed_jobs"), 1);
+        assert!(w.gh.writes().is_empty());
+
+        // Release re-run.
+        let w = World::new();
+        w.gh.add_run(REPO, make_run(|_| {}), stages(green(1)));
+        let g2 = w.gh.clone();
+        w.gh.on_merge(move |_pr, sha| {
+            g2.add_run(
+                REPO,
+                release_run(sha, |r| {
+                    r.status = "completed".into();
+                    r.conclusion = Some("failure".into());
+                }),
+                on_rerun(vec![RunStage::completed("failure")]),
+            );
+        });
+        w.fail("rerun_failed_jobs", u32::MAX, kind);
+        let err = w.run_with(&w.clock, confirm()).await.unwrap_err();
+        assert!(
+            matches!(&err, ShipError::Port(e) if !e.is_transient()),
+            "{err}"
+        );
+        assert_eq!(w.calls("rerun_failed_jobs"), 1);
+        assert_eq!(w.writes(WriteMethod::MergePr), 1);
+    }
+
+    // Approval.
+    let w = approving();
+    w.gh.add_run(REPO, run_action_required(), RunScript::default());
+    w.fail("approve_run", u32::MAX, Fault::Transient);
+    let err = w.run_with(&w.clock, confirm()).await.unwrap_err();
+    assert!(
+        matches!(&err, ShipError::Port(e) if !e.is_transient()),
+        "{err}"
+    );
+    assert_eq!(w.calls("approve_run"), 1);
+}
+
+#[tokio::test]
+async fn a_transient_read_right_after_a_rerun_does_not_repeat_the_rerun() {
+    // The re-run is recorded the moment it is made, so a read that fails on the next poll
+    // (listing runs, then jobs) cannot send ground back to re-run the same attempt.
+    let w = World::new();
+    w.gh.add_run(REPO, run_with("completed", "failure"), on_rerun(green(1)));
+    w.port.faults.lock().unwrap().after_rerun = Some(("runs:ci", 2, Fault::Transient));
+    let out = w.go().await;
+    assert_eq!(out.status, ShipStatus::Shipped);
+    assert_eq!(w.writes(WriteMethod::RerunFailedJobs), 1);
+}
+
+#[tokio::test]
+async fn a_transient_read_right_after_an_approval_does_not_repeat_the_approval() {
+    let w = approving();
+    w.gh.add_run(REPO, run_action_required(), on_approve());
+    w.port.faults.lock().unwrap().after_approve = Some(("runs:ci", 2, Fault::Transient));
+    let out = w.go().await;
+    assert_eq!(out.status, ShipStatus::Shipped);
+    assert_eq!(w.writes(WriteMethod::ApproveRun), 1);
+}
+
+#[tokio::test]
+async fn an_unreadable_stored_deadline_gets_a_fresh_budget_instead_of_waiting_forever() {
+    let w = approving();
+    w.gh.add_run(REPO, run_action_required(), on_approve());
+    let first = HookClock::new();
+    first.set_hook(|n| n == 1);
+    w.go_until_interrupted(&first).await;
+    let session = w.active().unwrap();
+    let mut data = session.data.clone();
+    data["deadlines"] = json!({ "ci": "not a date" });
+    w.store
+        .update_ship_session(
+            &session.id,
+            ShipSessionPatch {
+                data: Some(data),
+                ..ShipSessionPatch::default()
+            },
+        )
+        .unwrap();
+    w.fail("runs:ci", u32::MAX, Fault::Transient);
+    let out = w.go_ci_wait(2).await;
+    assert_eq!(out.status, ShipStatus::TimedOut);
+}
+
+// ---- resuming at the merge step re-checks the changeset snapshot ----
+
+#[tokio::test]
+async fn a_changeset_that_lands_after_a_dry_run_sends_the_confirm_back_to_the_snapshot_wait() {
+    let w = World::with_config(|c| c.version_pr_wait_minutes = 2);
+    w.gh.add_run(REPO, make_run(|_| {}), stages(green(1)));
+    let planned = w.dry().await;
+    assert_eq!(planned.status, ShipStatus::Planned);
+    assert_eq!(w.active().unwrap().step, "merge");
+
+    w.gh.set_dir(
+        REPO,
+        "main",
+        ".changeset",
+        &["a.md", "b.md", "c.md", "README.md", "config.json"],
+    );
+    let out = w.go().await;
+    assert_eq!(out.status, ShipStatus::TimedOut);
+    assert!(out.summary.contains("c.md"), "{}", out.summary);
+    assert!(w.gh.writes_of(WriteMethod::MergePr).is_empty());
+    assert_eq!(w.active().unwrap().step, "snapshot");
+    assert!(
+        w.logger
+            .messages(None)
+            .iter()
+            .any(|m| m.contains("went stale before the merge"))
+    );
+}
+
+#[tokio::test]
+async fn a_stale_pr_found_at_the_merge_is_refreshed_then_gated_again_and_merged() {
+    let w = World::new();
+    w.gh.add_run(REPO, make_run(|_| {}), stages(green(1)));
+    w.gh.add_run(
+        REPO,
+        make_run(|r| {
+            r.id = 101;
+            r.head_sha = "head-sha-2".into();
+        }),
+        stages(green(1)),
+    );
+    assert_eq!(w.dry().await.status, ShipStatus::Planned);
+    w.gh.set_dir(REPO, "main", ".changeset", &["a.md", "b.md", "c.md"]);
+    let gh = w.gh.clone();
+    let first_sleep = w.clock.count() + 1;
+    w.clock.set_hook(move |n| {
+        if n == first_sleep {
+            gh.update_pr(REPO, 1, |p| p.head_sha = "head-sha-2".into());
+            gh.set_pr_files(
+                REPO,
+                1,
+                vec![
+                    removed(".changeset/a.md"),
+                    removed(".changeset/b.md"),
+                    removed(".changeset/c.md"),
+                    sdk_file(),
+                ],
+            );
+        }
+        false
+    });
+    let out = w.go().await;
+    assert_eq!(out.status, ShipStatus::Shipped);
+    let merges = w.gh.writes_of(WriteMethod::MergePr);
+    assert_eq!(merges.len(), 1);
+    assert_eq!(merges[0].args["expectedHeadSha"], "head-sha-2");
+}
+
+#[tokio::test]
+async fn with_no_new_changeset_the_resumed_confirm_merges_as_before() {
+    let w = World::new();
+    w.gh.add_run(REPO, make_run(|_| {}), stages(green(1)));
+    assert_eq!(w.dry().await.status, ShipStatus::Planned);
+    assert_eq!(w.active().unwrap().step, "merge");
+    let out = w.go().await;
+    assert_eq!(out.status, ShipStatus::Shipped);
+    assert_eq!(w.writes(WriteMethod::MergePr), 1);
 }

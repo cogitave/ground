@@ -23,11 +23,13 @@ pub fn interpret_latest(pkg: &str, status: u16, body: &[u8]) -> PortResult<Optio
         return Ok(None);
     }
     if !(200..300).contains(&status) {
-        return Err(PortError::Http {
-            service: format!("npm registry for {pkg}"),
+        // The registry is only ever read, so a 5xx/429 is worth asking again.
+        return Err(PortError::from_http(
+            true,
+            &format!("npm registry for {pkg}"),
             status,
-            detail: None,
-        });
+            None,
+        ));
     }
     let json: Value = serde_json::from_slice(body)
         .map_err(|e| PortError::msg(format!("npm registry sent invalid JSON for {pkg}: {e}")))?;
@@ -66,9 +68,13 @@ impl RegistryPort for NpmRegistry {
             .get(registry_url(pkg, &self.base))
             .header("accept", "application/vnd.npm.install-v1+json")
             .send()
-            .await?;
+            .await
+            .map_err(|e| PortError::from_transport(true, &e))?;
         let status = res.status().as_u16();
-        let body = res.bytes().await?;
+        let body = res
+            .bytes()
+            .await
+            .map_err(|e| PortError::from_transport(true, &e))?;
         interpret_latest(pkg, status, &body)
     }
 }
@@ -112,5 +118,30 @@ mod tests {
                 .contains("500")
         );
         assert!(interpret_latest("x", 200, b"not json").is_err());
+    }
+
+    #[test]
+    fn a_registry_5xx_or_429_is_transient_and_other_failures_are_not() {
+        for status in [500, 502, 503, 429] {
+            assert!(
+                interpret_latest("x", status, b"{}")
+                    .unwrap_err()
+                    .is_transient(),
+                "{status}"
+            );
+        }
+        for status in [401, 403, 422] {
+            assert!(
+                !interpret_latest("x", status, b"{}")
+                    .unwrap_err()
+                    .is_transient(),
+                "{status}"
+            );
+        }
+        assert!(
+            !interpret_latest("x", 200, b"not json")
+                .unwrap_err()
+                .is_transient()
+        );
     }
 }

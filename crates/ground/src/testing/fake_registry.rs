@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::ports::{PortResult, RegistryPort};
+use crate::ports::{PortError, PortResult, RegistryPort};
 
 #[derive(Debug, Default)]
 struct Inner {
     queries: Vec<String>,
     versions: HashMap<String, String>,
     scheduled: HashMap<String, (u32, String)>,
+    failures: u32,
+    transient: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -38,6 +40,16 @@ impl FakeRegistry {
         self
     }
 
+    /// The next `n` queries (any package) fail: transient when `transient`, else permanent.
+    /// They are still recorded in `queries`.
+    pub fn fail_queries(&self, n: u32, transient: bool) -> &Self {
+        let mut inner = self.lock();
+        inner.failures = n;
+        inner.transient = transient;
+        drop(inner);
+        self
+    }
+
     /// Every package asked about, in order.
     pub fn queries(&self) -> Vec<String> {
         self.lock().queries.clone()
@@ -48,6 +60,15 @@ impl RegistryPort for FakeRegistry {
     async fn latest_version(&self, pkg: &str) -> PortResult<Option<String>> {
         let mut inner = self.lock();
         inner.queries.push(pkg.to_owned());
+        if inner.failures > 0 {
+            inner.failures -= 1;
+            let msg = format!("FakeRegistry: {pkg} query failed");
+            return Err(if inner.transient {
+                PortError::Transient(msg)
+            } else {
+                PortError::Message(msg)
+            });
+        }
         if let Some((after, version)) = inner.scheduled.get_mut(pkg) {
             if *after == 0 {
                 let version = version.clone();

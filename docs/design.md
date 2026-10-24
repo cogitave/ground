@@ -143,7 +143,10 @@ what it would do.
    jobs up to `maxRerunsPerRun` (default 1) and record the attempt in the flake
    ledger; after that, stop and report the failing jobs.
 5. **Merge** (requires `--confirm`): squash merge, admin if `adminMerge`. Before
-   merging, re-check that the head SHA did not move. Report whether the base is
+   merging (and before planning it), re-check that the head SHA did not move
+   and re-run the step 2 comparison: a changeset may have landed since a dry run
+   persisted this step, and a PR that does not delete it publishes nothing and
+   opens another version PR. If it is stale, go back to step 2. Report whether the base is
    still the default-branch tip (if not, the release will re-validate inline).
 6. **Release run**: find the `releaseWorkflow` run for the merge commit SHA; wait;
    re-run failed jobs once on failure; report which validation path it took if
@@ -152,6 +155,20 @@ what it would do.
    `package.json` diffs), poll the registry until it reports the new version,
    tolerating `registryLagMinutes` (default 10) of propagation lag.
 8. **Summary**: write the outcome to state and print it.
+
+**Transient read failures.** In every wait (steps 1, 2, 4, 6, 7) a READ that
+fails at the transport level (connect, timeout, request or body error) or is
+answered 5xx or 429 counts as an unanswered poll: ground logs a warning with
+the cause and polls again, so the step's own wait budget bounds an outage and
+the existing timed-out / registry-pending outcome (resumable) ends it. Writes
+(approve, re-run, merge) are never transient, whatever happened, because a
+write that failed in transit may have taken effect; they propagate and are
+never retried. Other 4xx answers are permanent and propagate. The merge step is
+not a wait; its errors propagate and `ground ship` is run again. A connect-level
+failure that is really a setup error (bad proxy host, TLS certificate) is
+classified transient too, so it is bounded by the wait budget rather than failing
+fast; the logged warning carries the cause. A stored wait deadline that cannot be
+parsed is replaced by a fresh budget.
 
 ### Repository config (`~/.ground/repos/cogitave__namzu.json`)
 

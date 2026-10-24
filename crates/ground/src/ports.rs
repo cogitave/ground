@@ -19,6 +19,14 @@ pub enum PortError {
     /// Anything that failed, with a message fit to show the operator.
     #[error("{0}")]
     Message(String),
+    /// A READ that failed in a way that says nothing about the resource and is
+    /// worth asking again: a transport failure (connect, timeout, request or
+    /// body error) or an HTTP 5xx/429 answer to a GET. Adapters produce it
+    /// only for reads; a write that failed in transit may have taken effect,
+    /// so a write error is never `Transient`. Wait loops treat it as an
+    /// unanswered poll; every other caller treats it like `Message`.
+    #[error("{0}")]
+    Transient(String),
     /// An HTTP answer that was not a success.
     #[error("{service} answered {status}{}", .detail.as_deref().map(|d| format!(": {d}")).unwrap_or_default())]
     Http {
@@ -34,9 +42,90 @@ impl PortError {
     }
 }
 
+impl PortError {
+    /// True only for a failed read worth asking again (see [`PortError::Transient`]).
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Transient(_))
+    }
+
+    /// The same error with the retry hint dropped. Callers that performed a
+    /// write use it so nothing downstream can mistake the failure for a poll
+    /// that merely went unanswered.
+    pub fn into_permanent(self) -> Self {
+        match self {
+            Self::Transient(m) => Self::Message(m),
+            other => other,
+        }
+    }
+
+    /// Classifies an HTTP failure. Only a read (`read == true`) answered with
+    /// 5xx or 429 is transient; 4xx otherwise and every write are permanent.
+    pub fn from_http(read: bool, service: &str, status: u16, detail: Option<String>) -> Self {
+        let err = Self::Http {
+            service: service.to_owned(),
+            status,
+            detail,
+        };
+        if read && (status == 429 || (500..600).contains(&status)) {
+            Self::Transient(err.to_string())
+        } else {
+            err
+        }
+    }
+
+    /// Classifies a transport failure of a request. Only a read that failed
+    /// to connect, timed out, or hit a request/body error is transient. The
+    /// message carries the whole `source()` chain, since reqwest's own text
+    /// ("error sending request for url") names no cause.
+    pub fn from_transport(read: bool, err: &reqwest::Error) -> Self {
+        let message = error_chain(err);
+        if transport_is_transient(
+            read,
+            err.is_connect(),
+            err.is_timeout(),
+            err.is_request(),
+            err.is_body(),
+        ) {
+            Self::Transient(message)
+        } else {
+            Self::Message(message)
+        }
+    }
+}
+
+/// The classification behind [`PortError::from_transport`], over the facts reqwest reports.
+/// A write is never transient; a read is when it failed to connect, timed out, or hit a
+/// request or body error. Any other failure of a read (a redirect loop, a decode error, a
+/// builder error) is permanent.
+pub(crate) fn transport_is_transient(
+    read: bool,
+    is_connect: bool,
+    is_timeout: bool,
+    is_request: bool,
+    is_body: bool,
+) -> bool {
+    read && (is_connect || is_timeout || is_request || is_body)
+}
+
+/// `err` and each of its sources, joined as `a: b: c`.
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        source = cause.source();
+    }
+    out
+}
+
 impl From<reqwest::Error> for PortError {
+    /// Permanent: callers that know the method use [`PortError::from_transport`].
     fn from(err: reqwest::Error) -> Self {
-        Self::Message(err.to_string())
+        Self::from_transport(false, &err)
     }
 }
 
@@ -248,4 +337,30 @@ pub trait GitHubPort: Send + Sync {
 pub trait RegistryPort: Send + Sync {
     /// `dist-tags.latest` of the package, or `None` when the registry has no such package.
     fn latest_version(&self, pkg: &str) -> impl Future<Output = PortResult<Option<String>>> + Send;
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::transport_is_transient;
+
+    #[test]
+    fn only_a_read_that_failed_in_transit_is_transient() {
+        // (connect, timeout, request, body)
+        let kinds = [
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ];
+        for (c, t, r, b) in kinds {
+            assert!(transport_is_transient(true, c, t, r, b), "{c} {t} {r} {b}");
+            assert!(
+                !transport_is_transient(false, c, t, r, b),
+                "{c} {t} {r} {b}"
+            );
+        }
+        // Some other reqwest failure (redirect loop, decode, builder).
+        assert!(!transport_is_transient(true, false, false, false, false));
+        assert!(!transport_is_transient(false, false, false, false, false));
+    }
 }

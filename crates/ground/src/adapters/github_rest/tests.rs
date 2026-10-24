@@ -399,3 +399,119 @@ fn a_non_json_success_body_names_the_status_and_the_body() {
     assert_eq!(decode_body(502, b"<html>").unwrap(), Value::Null);
     assert_eq!(decode_body(204, b"").unwrap(), Value::Null);
 }
+
+// ---- transient or permanent: only a failed READ is worth asking again ----
+
+#[test]
+fn only_a_read_answered_5xx_or_429_is_transient() {
+    for status in [500, 502, 503, 504, 429] {
+        assert!(PortError::from_http(true, "GitHub", status, None).is_transient());
+        assert!(!PortError::from_http(false, "GitHub", status, None).is_transient());
+    }
+    for status in [400, 401, 403, 404, 410, 422] {
+        assert!(!PortError::from_http(true, "GitHub", status, None).is_transient());
+    }
+    assert_eq!(
+        PortError::from_http(true, "GitHub", 503, Some("busy".into())).to_string(),
+        "GitHub answered 503: busy"
+    );
+}
+
+#[test]
+fn into_permanent_drops_the_retry_hint_and_keeps_the_text() {
+    let err = PortError::Transient("x".into()).into_permanent();
+    assert!(!err.is_transient());
+    assert_eq!(err.to_string(), "x");
+}
+
+#[tokio::test]
+async fn a_get_answered_503_or_429_is_transient_and_a_404_or_401_is_not() {
+    let (base, _) = serve(vec![
+        ("GET /repos/o/r/pulls/1 ", 503, json!({"message": "down"})),
+        ("GET /repos/o/r/pulls/2 ", 429, json!({"message": "slow"})),
+        (
+            "GET /repos/o/r/pulls/3 ",
+            404,
+            json!({"message": "Not Found"}),
+        ),
+        ("GET /repos/o/r/pulls/4 ", 401, json!({"message": "Bad"})),
+        ("GET /repos/o/r/pulls/5 ", 422, json!({"message": "No"})),
+    ])
+    .await;
+    let g = gh(&base, RecordingExec::new(""));
+    assert!(g.get_pr("o/r", 1).await.unwrap_err().is_transient());
+    assert!(g.get_pr("o/r", 2).await.unwrap_err().is_transient());
+    for n in [3, 4, 5] {
+        assert!(!g.get_pr("o/r", n).await.unwrap_err().is_transient());
+    }
+    // list_dir goes through `send` directly; a 5xx there is transient too.
+    let (base, _) = serve(vec![("GET /repos/o/r/contents/", 502, json!({}))]).await;
+    let g = gh(&base, RecordingExec::new(""));
+    assert!(
+        g.list_dir("o/r", "main", "d")
+            .await
+            .unwrap_err()
+            .is_transient()
+    );
+}
+
+#[tokio::test]
+async fn a_post_answered_5xx_is_never_transient() {
+    let (base, seen) = serve(vec![
+        ("POST /repos/o/r/actions/runs/7/approve", 503, json!({})),
+        (
+            "POST /repos/o/r/actions/runs/7/rerun-failed-jobs",
+            429,
+            json!({}),
+        ),
+        ("PUT /repos/o/r/pulls/5/merge", 502, json!({})),
+    ])
+    .await;
+    let g = gh(&base, RecordingExec::new(""));
+    assert!(!g.approve_run("o/r", 7).await.unwrap_err().is_transient());
+    assert!(
+        !g.rerun_failed_jobs("o/r", 7)
+            .await
+            .unwrap_err()
+            .is_transient()
+    );
+    let opts = MergeOptions {
+        method: MergeMethod::Squash,
+        admin: false,
+        expected_head_sha: "h".into(),
+    };
+    assert!(
+        !g.merge_pr("o/r", 5, &opts)
+            .await
+            .unwrap_err()
+            .is_transient()
+    );
+    assert_eq!(seen.lock().unwrap().len(), 3);
+}
+
+/// A base URL nobody listens on: connecting is refused at once.
+async fn dead_base() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    base
+}
+
+#[tokio::test]
+async fn a_refused_connection_is_transient_for_a_get_only_and_names_its_cause() {
+    let g = gh(&dead_base().await, RecordingExec::new(""));
+    let err = g.get_pr("o/r", 1).await.unwrap_err();
+    assert!(err.is_transient(), "{err}");
+    let text = err.to_string();
+    assert!(text.starts_with("error sending request"), "{text}");
+    assert!(
+        text.len() > "error sending request for url".len() + 20,
+        "{text}"
+    );
+    assert!(
+        text.to_lowercase().contains("connect") || text.to_lowercase().contains("refused"),
+        "{text}"
+    );
+    let err = g.approve_run("o/r", 7).await.unwrap_err();
+    assert!(!err.is_transient(), "{err}");
+}
