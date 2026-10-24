@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand, ValueEnum};
 
-use crate::engine::select::{SelectOptions, Selection, select};
+use crate::engine::select::{RELAXED_LOCKFILE, SelectOptions, Selection, select};
 use crate::engine::store::{ManifestStore, default_dir};
 
 /// Printed by `--format vitest` when nothing is selected.
@@ -92,6 +92,7 @@ pub fn cmd_select(home: &Path, args: SelectArgs) -> Result<i32, String> {
     let root = root_of(args.root)?;
     let manifests = args.manifests.unwrap_or_else(|| default_dir(home, &root));
     let mut opts = SelectOptions::new(root, args.base, manifests);
+    opts.lockfile_global = args.global.iter().any(|g| g == RELAXED_LOCKFILE);
     opts.global.extend(args.global);
     opts.always = args.always;
     if !args.tests.is_empty() {

@@ -12,6 +12,10 @@
 //!   version under the same directory name;
 //! - a version that is not a registry semver (`file+`, `https+`, `github.com+`
 //!   store names pin a location, not content).
+//!
+//! The name alone is not trusted for what is inside: each record carries a
+//! content hash of the package directory, taken when the run ends. A registry
+//! that republishes a version (a private mirror) is covered by the same hash.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -80,6 +84,7 @@ pub fn pnpm_dep(rel: &Path) -> Option<DepEntry> {
     Some(DepEntry {
         dep: format!("{dir}/{named}"),
         store: p[..=i + 1].join("/"),
+        blake3: String::new(),
     })
 }
 
@@ -120,7 +125,14 @@ pub fn pnpm_link_dep(root: &Path, rel: &Path) -> Option<(PathBuf, DepEntry)> {
         let dep = pnpm_dep(resolved)?;
         // Only the package directory itself: anything else it names is not
         // pinned by the store entry's name.
-        return (PathBuf::from(dep.path()) == resolved).then_some((link, dep));
+        if PathBuf::from(dep.path()) != resolved {
+            return None;
+        }
+        // The lexical result must be what the filesystem says too: a
+        // symlinked ancestor of the link can send the real path elsewhere.
+        let real = std::fs::canonicalize(&abs).ok()?;
+        let expect = std::fs::canonicalize(root.join(resolved)).ok()?;
+        return (real == expect).then_some((link, dep));
     }
     None
 }
@@ -249,6 +261,33 @@ mod tests {
         assert_eq!(got("packages/a/node_modules/out/x.js"), None);
         assert_eq!(got("packages/a/node_modules/plain/x.js"), None);
         assert_eq!(got("src/x.js"), None);
+    }
+
+    #[test]
+    fn a_link_reached_through_a_symlinked_ancestor_is_not_collapsed() {
+        let d = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let store = root.join("node_modules/.pnpm");
+        std::fs::create_dir_all(store.join("chai@5.2.0/node_modules/chai")).unwrap();
+        // `real/a/node_modules/chai -> ../../../node_modules/.pnpm/...` is
+        // right lexically from `alias/a` (a link to `real`) only by accident:
+        // the real directory sits one level deeper than the link claims.
+        std::fs::create_dir_all(root.join("real/deeper/a/node_modules")).unwrap();
+        std::os::unix::fs::symlink("real/deeper", root.join("alias")).unwrap();
+        std::os::unix::fs::symlink(
+            "../../../../node_modules/.pnpm/chai@5.2.0/node_modules/chai",
+            root.join("real/deeper/a/node_modules/chai"),
+        )
+        .unwrap();
+        // Through the real path the link resolves to the store entry.
+        assert!(pnpm_link_dep(&root, Path::new("real/deeper/a/node_modules/chai/x.js")).is_some());
+        // Through the alias, lexically `alias/a/node_modules/chai` -> the same
+        // text resolves to a path that is not the store entry for the
+        // filesystem, so it stays a per-file record.
+        assert_eq!(
+            pnpm_link_dep(&root, Path::new("alias/a/node_modules/chai/x.js")).map(|r| r.1.dep),
+            None
+        );
     }
 
     #[test]

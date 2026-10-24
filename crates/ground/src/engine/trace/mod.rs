@@ -33,7 +33,9 @@ mod tracer;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub use record::{Access, AccessKind, Recorder, TraceManifest, hash_link, hash_path, normalise};
+pub use record::{
+    Access, AccessKind, Recorder, TraceManifest, hash_link, hash_package, hash_path, normalise,
+};
 
 /// Why a trace produced no manifest.
 #[derive(Debug, thiserror::Error)]

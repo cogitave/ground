@@ -35,7 +35,7 @@ pub const DEFAULT_GLOBAL: &[&str] = &[
 /// The lockfile glob that stops being global once every manifest records the
 /// installed packages it read: install state is then checked package by
 /// package, and a test that reads the lockfile itself has it as an input.
-const RELAXED_LOCKFILE: &str = "**/pnpm-lock.yaml";
+pub const RELAXED_LOCKFILE: &str = "**/pnpm-lock.yaml";
 
 /// What counts as a test file when enumerating the repository.
 pub const DEFAULT_TESTS: &[&str] = &[
@@ -65,6 +65,10 @@ pub struct SelectOptions {
     /// matches no glob selects everything: it may be a test the runner runs
     /// that the default globs cannot list.
     pub tests_declared: bool,
+    /// The caller listed the lockfile glob itself (`--global '**/pnpm-lock.yaml'`):
+    /// the lockfile stays a global input even though manifests record installed
+    /// packages.
+    pub lockfile_global: bool,
 }
 
 impl SelectOptions {
@@ -77,6 +81,7 @@ impl SelectOptions {
             always: vec![],
             tests: DEFAULT_TESTS.iter().map(|s| (*s).to_owned()).collect(),
             tests_declared: false,
+            lockfile_global: false,
         }
     }
 }
@@ -349,8 +354,9 @@ pub fn select(opts: &SelectOptions) -> Selection {
     // (a manifest written before that existed lists node_modules files only,
     // and a lockfile change then has no other way in). With no manifest at all
     // every test is selected anyway.
-    let packages_recorded =
-        !relevant.is_empty() && relevant.iter().all(|m| m.deps_format >= DEPS_FORMAT);
+    let packages_recorded = !opts.lockfile_global
+        && !relevant.is_empty()
+        && relevant.iter().all(|m| m.deps_format >= DEPS_FORMAT);
     let global_patterns: Vec<String> = opts
         .global
         .iter()
@@ -486,14 +492,16 @@ pub fn select(opts: &SelectOptions) -> Selection {
                 reasons.extend(
                     m.deps
                         .iter()
-                        .filter(|d| {
-                            !installed
-                                .get(&dep_path(root, m, d))
-                                .copied()
-                                .unwrap_or(false)
+                        .filter_map(|d| match installed.get(&dep_path(root, m, d)) {
+                            Some(Some(h))
+                                if !d.blake3.is_empty() && h.eq_ignore_ascii_case(&d.blake3) =>
+                            {
+                                None
+                            }
+                            Some(Some(_)) => Some(format!("dependency changed: {}", d.dep)),
+                            _ => Some(format!("dependency not installed: {}", d.dep)),
                         })
-                        .take(MAX_INPUT_REASONS)
-                        .map(|d| format!("dependency not installed: {}", d.dep)),
+                        .take(MAX_INPUT_REASONS),
                 );
                 reasons.extend(
                     m.absent
@@ -532,14 +540,15 @@ fn dep_path(root: &Path, m: &Manifest, d: &DepEntry) -> PathBuf {
     resolve(root, &m.root, &d.path())
 }
 
-/// Whether each distinct package the manifests recorded is installed now: a
-/// real directory (not a link, not a file) holding a `package.json`. `Err`
+/// The content hash of each distinct package the manifests recorded, or
+/// `None` when it is not installed now: not a real directory (a link or a file
+/// does not count), no `package.json`, or unreadable. `Err`
 /// when a virtual store a manifest recorded cannot be listed (no install, or
 /// no right to look), which fails closed to selecting everything.
 fn installed_packages(
     root: &Path,
     manifests: &[&Manifest],
-) -> Result<HashMap<PathBuf, bool>, String> {
+) -> Result<HashMap<PathBuf, Option<String>>, String> {
     let mut stores = BTreeSet::new();
     let mut deps = BTreeSet::new();
     for m in manifests {
@@ -557,11 +566,16 @@ fn installed_packages(
         }
     }
     Ok(deps
-        .into_iter()
+        .into_par_iter()
         .map(|p| {
             let dir = std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir());
             let ok = dir && std::fs::metadata(p.join("package.json")).is_ok_and(|m| m.is_file());
-            (p, ok)
+            let hash = if ok {
+                super::trace::hash_package(&p)
+            } else {
+                None
+            };
+            (p, hash)
         })
         .collect())
 }

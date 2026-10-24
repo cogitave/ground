@@ -385,7 +385,14 @@ impl Recorder {
         }
         // Probes of paths inside a recorded package say nothing its name does
         // not: the same version has the same files.
-        let deps: Vec<DepEntry> = dep_set.into_iter().collect();
+        let deps: Vec<DepEntry> = dep_set
+            .into_iter()
+            .map(|mut d| {
+                d.blake3 =
+                    hash_package(&self.root.join(d.path())).unwrap_or_else(|| MISSING.into());
+                d
+            })
+            .collect();
         let dep_dirs: Vec<String> = deps.iter().map(|d| format!("{}/", d.path())).collect();
         absent.retain(|a| !dep_dirs.iter().any(|d| a.starts_with(d.as_str())));
         let toolchain = self
@@ -432,6 +439,53 @@ fn to_slash(p: &Path) -> String {
 
 /// blake3 (hex) of a regular file's bytes, or of a directory's sorted entry
 /// names tagged by type. None when it is gone or is neither (device, socket).
+/// blake3 (hex) of everything inside a package directory: every entry's name
+/// and kind, each file's content, each symlink's target text, recursively and
+/// in sorted order. `None` when anything cannot be read, which the caller
+/// treats as changed. Nothing is skipped: build output and nested installs are
+/// part of what a test can read.
+pub fn hash_package(dir: &Path) -> Option<String> {
+    fn walk(dir: &Path, out: &mut blake3::Hasher) -> Option<()> {
+        let mut entries: Vec<(Vec<u8>, PathBuf, fs::FileType)> = Vec::new();
+        for e in fs::read_dir(dir).ok()? {
+            let e = e.ok()?;
+            let name = e.file_name().to_string_lossy().as_bytes().to_vec();
+            entries.push((name, e.path(), e.file_type().ok()?));
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, path, ty) in entries {
+            out.update(&(name.len() as u64).to_le_bytes());
+            out.update(&name);
+            if ty.is_dir() {
+                out.update(b"d");
+                walk(&path, out)?;
+                out.update(b"\0end");
+            } else if ty.is_symlink() {
+                out.update(b"l");
+                let t = fs::read_link(&path).ok()?;
+                let t = t.to_string_lossy();
+                out.update(&(t.len() as u64).to_le_bytes());
+                out.update(t.as_bytes());
+            } else if ty.is_file() {
+                out.update(b"f");
+                let mut h = blake3::Hasher::new();
+                io::copy(&mut fs::File::open(&path).ok()?, &mut h).ok()?;
+                out.update(h.finalize().as_bytes());
+            } else {
+                out.update(b"o");
+            }
+        }
+        Some(())
+    }
+    if !fs::metadata(dir).ok()?.is_dir() {
+        return None;
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"package\0");
+    walk(dir, &mut hasher)?;
+    Some(hasher.finalize().to_hex().to_string())
+}
+
 pub fn hash_path(path: &Path) -> Option<String> {
     let meta = fs::metadata(path).ok()?;
     if meta.is_file() {

@@ -142,7 +142,10 @@ fn a_command_that_cannot_start_is_an_error_not_a_manifest() {
     let runner = Fake {
         root: fx.root.clone(),
         tests: vec!["pkg/src/a.test.ts".into(), "pkg/src/b.test.ts".into()],
-        scripts: vec![("pkg/src/a.test.ts".into(), "true".into())],
+        scripts: vec![(
+            "pkg/src/a.test.ts".into(),
+            format!("cat {} >/dev/null", q(&fx.root.join("pkg/src/a.test.ts"))),
+        )],
     };
     let report = trace_tests(&runner, &runner.list().unwrap(), &plan(&fx, 2)).unwrap();
     assert_eq!(report.traced, 1);
@@ -206,7 +209,8 @@ fn collapses_pnpm_packages_in_a_traced_run() {
         scripts: vec![(
             "pkg/src/a.test.ts".into(),
             format!(
-                "cat {} {} >/dev/null",
+                "cat {} {} {} >/dev/null",
+                q(&fx.root.join("pkg/src/a.test.ts")),
                 q(&pkg.join("package.json")),
                 q(&pkg.join("dist/a.js"))
             ),
@@ -217,6 +221,10 @@ fn collapses_pnpm_packages_in_a_traced_run() {
     let m = &load(&fx)[0];
     assert_eq!(m.deps.len(), 1);
     assert_eq!(m.deps[0].dep, "zod@3.25.76/zod");
+    assert_eq!(
+        m.deps[0].blake3,
+        ground::engine::trace::hash_package(&pkg).unwrap()
+    );
     assert!(
         m.files.iter().all(|f| !f.path.contains("node_modules")),
         "{:?}",
@@ -287,5 +295,41 @@ fn real_vitest_manifests_hold_no_discovery_directories() {
             .all(|d| !d.starts_with(&format!("{pkg_rel}/src"))
                 || *d == Path::new(&m.test).parent().unwrap().to_str().unwrap()),
         "discovery directories leaked into the manifest: {dirs:?}"
+    );
+}
+
+#[test]
+fn a_run_that_exits_zero_without_reading_its_test_leaves_no_manifest() {
+    let fx = fx();
+    let r = &fx.root;
+    let a = "pkg/src/a.test.ts";
+    // A first, complete trace exists; the second run finds no test.
+    let good = Fake {
+        root: r.clone(),
+        tests: vec![a.into()],
+        scripts: vec![(a.into(), format!("cat {} >/dev/null", q(&r.join(a))))],
+    };
+    let report = trace_tests(&good, &good.list().unwrap(), &plan(&fx, 1)).unwrap();
+    assert!(report.ok(), "{report:?}");
+    assert_eq!(load(&fx).len(), 1);
+    let empty = Fake {
+        root: r.clone(),
+        tests: vec![a.into()],
+        scripts: vec![(
+            a.into(),
+            format!("cat {} >/dev/null", q(&r.join("pkg/src/lib.ts"))),
+        )],
+    };
+    let report = trace_tests(&empty, &empty.list().unwrap(), &plan(&fx, 1)).unwrap();
+    assert_eq!(report.traced, 0, "{report:?}");
+    assert_eq!(report.errors.len(), 1);
+    assert!(
+        report.errors[0].1.contains("never read"),
+        "{:?}",
+        report.errors
+    );
+    assert!(
+        ManifestStore::new(&fx.out).load_all().unwrap().is_empty(),
+        "the stale manifest of the earlier run is gone too"
     );
 }

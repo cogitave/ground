@@ -33,17 +33,21 @@ coverage-based selection lost a quarter of the suite.
   bytes is still a change.
 - **Installed packages** are recorded as packages, not files. pnpm's store
   entry `node_modules/.pnpm/<name>@<version>[_<peers>]/node_modules/<name>`
-  has a directory name that pins name, version and peer set, and pnpm verifies
-  it against the lockfile's integrity, so a read of any file in it is recorded
-  as `{dep: "<store dir>/<name>", store: "<path to .pnpm>"}` and nothing
-  else. This also covers a read through a symlink to such a package (the
+  has a directory name that pins name, version and peer set, so a read of any
+  file in it is recorded as `{dep: "<store dir>/<name>", store: "<path to
+  .pnpm>", blake3}` and nothing else. The name says which package it is; the
+  `blake3` (every entry's name and kind, each file's bytes, each symlink's
+  target text, recursively, nothing skipped) says nothing inside it moved: a
+  hand edit, a rebuilt native addon, a build script's output, a hardlinked
+  store file mutated in place all change it. This also covers a read through a symlink to such a package (the
   `packages/x/node_modules/vitest` link, a store entry's dependency links): the
   link's target text stays a `link` record, so a retarget is seen, and the
   package it resolved to becomes the dep. What the name does not pin stays per
   file: a version that is not a registry semver (`file+`, `https+`, git store
   names), a link that does not resolve to exactly a package directory. Another
   layout (npm, yarn) keeps its files and gains the owning `package.json`'s
-  hash. `deps_format` marks a manifest that records packages this way.
+  hash. `deps_format` 2 marks a manifest that records packages this way; a
+  format 1 record (name only, no hash) is never trusted and selects its test.
 - A file the tree rewrote while it was reading it (its inode, size or
   timestamps moved between the first read and the end of the run) is recorded
   as `volatile`, a file gone by the end as `missing`; neither equals any hash,
@@ -59,14 +63,19 @@ coverage-based selection lost a quarter of the suite.
   when a declared environment variable now differs, when a manifest records no
   engine, toolchain or commit, or when the engine version differs.
 - **The lockfile is global only for older manifests.** Once every manifest has
-  `deps_format` >= 1, `pnpm-lock.yaml` stops being a global glob: select asks,
+  `deps_format` >= 2, `pnpm-lock.yaml` stops being a global glob: select asks,
   for each recorded package, whether its directory is still installed (a real
-  directory holding a `package.json`; gone, replaced by a file or a link, or
-  emptied selects the tests that recorded it). If a recorded store cannot be
-  listed at all (no install, no permission) everything is selected, and a
-  manifest without package records keeps the lockfile global. A test that read
-  `pnpm-lock.yaml` itself has it as a hashed file input. Install must have run
-  before select; the check trusts the directory name, not the files in it.
+  directory holding a `package.json`) and whether its content hash is still
+  the recorded one (gone, replaced by a file or a link, emptied or changed
+  selects the tests that recorded it, reason `dependency not installed` or
+  `dependency changed`). If a recorded store cannot be listed at all (no
+  install, no permission) everything is selected, and a manifest without
+  package records keeps the lockfile global. Listing the lockfile yourself
+  (`ground select --global '**/pnpm-lock.yaml'`) keeps it global; the
+  relaxation applies only when you did not. A test that read `pnpm-lock.yaml`
+  itself has it as a hashed file input. Install must have run before select.
+  A native addon rebuilt under another Node ABI is covered twice: its bytes
+  change, and the `node` binary is in the toolchain fingerprint.
 - **Tests the globs cannot name.** Selection can only choose among the files
   the test globs list (`*.test.*`, `*.spec.*`, `*.test-d.*` by default). Unless
   `--tests` declares the list, a changed code file under `__tests__/`, `test/`
@@ -103,10 +112,16 @@ coverage-based selection lost a quarter of the suite.
   names, so `ground select --manifests <dir>` (or `manifests import`) reads
   them directly. A wrapper after `--` runs in front of vitest for each test (a
   repository whose tests need an owned temp directory or home creates it
-  there). A multi-project vitest config (`test.projects`) is refused rather
-  than traced wrongly. A test that failed while traced keeps its manifest
-  (select always picks it) and is reported; a test that could not be traced
-  leaves none.
+  there). A multi-project vitest config (`test.projects`/`test.workspace`) and a
+  `vitest.workspace.*` file at the package or the root are refused rather than
+  traced wrongly; a base `test.dir` is honoured when the include is pinned, and
+  the generated config sets `passWithNoTests: false`. A run that exits 0 but
+  never read its own test file ran no test (an include that matched nothing):
+  it is reported as an error and keeps no manifest. A test that failed while
+  traced keeps its manifest (select always picks it) and is reported; a test
+  that could not be traced leaves none, and the manifest an earlier trace left
+  for it is removed before the new trace starts, so an error never leaves a
+  stale manifest in use.
 - On the owner's machine, groundd re-traces main's tip in a local worktree after
   each push (32 cores: 1000 test files took 383 s with coverage; tracing is in
   the same range). CI full runs can produce them too and publish them as an
@@ -177,8 +192,9 @@ listings: a test that lists a directory itself still has that directory as an
 input.
 
 Re-measured with the same 60 commits and the same emulation harness, against
-manifests traced with `trace-tests` (1000 files, 28 workers, 174 s wall, all
-passing but one that timed out under that load and passes alone):
+manifests traced with `trace-tests` (1000 files, 28 workers, 158 s wall, all
+passing; the package records now carry content hashes and the wall time did not
+move):
 
 | rule | files mean | time mean | time median | commits selecting everything | <10% of time |
 |---|---|---|---|---|---|
@@ -194,9 +210,24 @@ on the tip: unchanged tree 0 of 1000 (the one test that failed while traced is
 always picked), a new file in `src` 0, `pnpm-lock.yaml` touched 0, one source
 file edited 10.
 
-Manifest size for the same 1000 tests: 59 MB total, p50 41 KB, max 223 KB
+Manifest size for the same 1000 tests: 61 MB total, p50 43 KB, max 226 KB
 (was 215 MB, p50 192 KB, max 427 KB): no directory listings, packages as one
-record each, and the store writes compact JSON.
+record each, and the store writes compact JSON. `ground select` on the
+unchanged tree takes 1.4 s, including hashing every recorded package.
+
+**Differential soundness trial** (13 mutations, each followed by the full
+`@namzu/sdk` suite, 0 failing files unmutated): function bodies throwing at
+fan-in 1, 9, 15, 60, 250 and 408 (selected exactly 1, 9, 15, 60, 250, 408; 1,
+1, 2, 11, 238, 43 files failed); three top-level changes (a constant, another
+constant, a top-level throw); a new file in a directory a test scans; a fixture
+corrupted; a file read only by a child process; and a dependency edited in
+place inside `node_modules/.pnpm`. The first round had 12 mutations with no
+miss and one with two: the in-place dependency edit selected 0 and
+`browser.test.ts` and `computer-use.test.ts` failed. With the package content
+hash the same edit selects exactly those two (reason `dependency changed:
+jsonschema@1.5.0/jsonschema`), and the restored tree selects 0 of 1000 again.
+The other 12 were not re-run: their selection does not depend on package
+records. 13 of 13 mutations: no miss.
 
 ## Limits
 
@@ -216,14 +247,26 @@ Known and deliberate; each is a way a trace can under-record.
 - A toolchain or global file that was dirty in the working tree when the
   manifests were traced and has since been reverted is not seen as changed
   (the diff is against commits). Trace from a clean checkout.
-- A package record trusts the pnpm directory name: a file edited by hand
-  inside `node_modules/.pnpm/...`, or a different registry serving the same
-  version, is not seen. `node_modules/.modules.yaml` and
+- A package record pins the package by directory name **and** content hash.
+  What it cannot see is a package that is the same in both and still behaves
+  differently, which the hash makes require a read outside the package
+  directory (the dependency links beside it are recorded as links, so a
+  retarget is seen). A private registry that reuses a version is covered by the
+  hash. `node_modules/.modules.yaml` and
   `.pnpm-workspace-state-v1.json` (a prune timestamp, the store location) are
   not recorded; the packages a test read are checked on their own.
 - `trace-tests` keeps the test file's own directory as an input (vitest lists
   the parent of the literal include), so a file added next to a test selects
   that test only.
+- A link under `node_modules` reached through a symlinked ancestor is only
+  collapsed to a package when the lexical and the real path agree; otherwise it
+  keeps per-file records (over-selection, not unsound).
+- A repository that changes its build-script allowlist
+  (`onlyBuiltDependencies`) changes the build output inside package
+  directories, which the content hash sees; nothing else needs to be global.
+- Not measured: a lockfile commit that changes a dependency's version. The
+  reinstall replaces the package directory, which select sees as not installed
+  and selects its dependents, but the 60-commit emulation cannot model it.
 - x32 and 32-bit syscalls fail the trace. aarch64 compiles from the same
   tables but has not been built here.
 

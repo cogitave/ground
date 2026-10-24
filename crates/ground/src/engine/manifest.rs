@@ -25,7 +25,7 @@ fn is_zero(n: &u32) -> bool {
 }
 
 /// The manifest layout that records installed packages as [`DepEntry`].
-pub const DEPS_FORMAT: u32 = 1;
+pub const DEPS_FORMAT: u32 = 2;
 
 impl FileEntry {
     pub fn file(path: impl Into<String>, blake3: impl Into<String>) -> Self {
@@ -40,9 +40,10 @@ impl FileEntry {
 /// One installed package the test read from, recorded as the package rather
 /// than as every file read from it. Only a layout whose directory name pins
 /// the package's identity is collapsed this way (pnpm's virtual store:
-/// `.pnpm/<name>@<version>[_<peers>]/node_modules/<name>`, which pnpm
-/// verifies against the lockfile's integrity), so the directory being
-/// present is the same fact as every file in it being unchanged.
+/// `.pnpm/<name>@<version>[_<peers>]/node_modules/<name>`), and the record
+/// carries a content hash of the whole directory: the name says which package
+/// it is, the hash says nothing inside it moved (a hand edit, a rebuilt native
+/// addon, a mutated hardlink).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct DepEntry {
     /// `<virtual-store directory name>/<package name>`, e.g.
@@ -51,6 +52,12 @@ pub struct DepEntry {
     /// The virtual store (`.../node_modules/.pnpm`), relative to the
     /// manifest's root.
     pub store: String,
+    /// blake3 of the package directory's whole content (see
+    /// `trace::hash_package`) as the run ended, or `missing` when it could not
+    /// be read. Empty only in a manifest of layout 1, which pinned the name
+    /// alone and so is never trusted for a package.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub blake3: String,
 }
 
 impl DepEntry {

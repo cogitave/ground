@@ -545,11 +545,14 @@ fn install(fx: &Fx) {
     }
 }
 
-fn dep(dir: &str, name: &str) -> DepEntry {
-    DepEntry {
+fn dep(root: &Path, dir: &str, name: &str) -> DepEntry {
+    let mut d = DepEntry {
         dep: format!("{dir}/{name}"),
         store: "node_modules/.pnpm".into(),
-    }
+        blake3: String::new(),
+    };
+    d.blake3 = crate::engine::trace::hash_package(&root.join(d.path())).unwrap();
+    d
 }
 
 /// a.test.ts depends on zod, b.test.ts on chai, both recorded per package.
@@ -559,9 +562,9 @@ fn dep_fixture() -> Fx {
     edit_all(&fx, |m| {
         m.deps_format = crate::engine::manifest::DEPS_FORMAT;
         m.deps = vec![if m.test == "a.test.ts" {
-            dep(ZOD, "zod")
+            dep(&fx.root, ZOD, "zod")
         } else {
-            dep(CHAI, "chai")
+            dep(&fx.root, CHAI, "chai")
         }];
     });
     fx
@@ -667,15 +670,50 @@ fn no_node_modules_at_all_selects_everything() {
 }
 
 #[test]
-fn package_changes_inside_a_recorded_directory_are_not_looked_for() {
-    // The directory name pins name, version and peers; pnpm checks integrity.
+fn a_change_inside_a_recorded_package_selects_its_dependents_only() {
+    // The directory name is unchanged; the content is not (a hand edit, a
+    // rebuilt native addon, a hardlinked store file mutated in place).
     let fx = dep_fixture();
+    let f = format!("node_modules/.pnpm/{ZOD}/node_modules/zod/index.js");
+    write(&fx.root, &f, "edited by hand");
+    let s = run(&fx);
+    assert!(!s.all, "{s:?}");
+    assert_eq!(names(&s), ["a.test.ts"]);
+    assert_eq!(
+        s.selected[0].reasons,
+        [format!("dependency changed: {ZOD}/zod")]
+    );
+    write(&fx.root, &f, "1");
+    assert!(names(&run(&fx)).is_empty());
+    // A file added (build output) and a nested directory count too.
     write(
         &fx.root,
-        &format!("node_modules/.pnpm/{ZOD}/node_modules/zod/index.js"),
-        "edited by hand",
+        &format!("node_modules/.pnpm/{ZOD}/node_modules/zod/build/addon.node"),
+        "x",
     );
-    assert!(names(&run(&fx)).is_empty());
+    assert_eq!(names(&run(&fx)), ["a.test.ts"]);
+}
+
+#[test]
+fn a_package_record_without_a_content_hash_is_never_trusted() {
+    let fx = dep_fixture();
+    edit_all(&fx, |m| {
+        for d in &mut m.deps {
+            d.blake3.clear();
+        }
+    });
+    assert_eq!(names(&run(&fx)), ["a.test.ts", "b.test.ts"]);
+}
+
+#[test]
+fn an_explicit_lockfile_global_overrides_the_relaxation() {
+    let fx = dep_fixture();
+    write(&fx.root, "pnpm-lock.yaml", "lock v2");
+    let mut opts = SelectOptions::new(fx.root.clone(), "base".into(), fx.mdir.clone());
+    opts.lockfile_global = true;
+    let s = select(&opts);
+    assert!(s.all, "{s:?}");
+    assert!(all_reason(&s).contains("pnpm-lock.yaml"));
 }
 
 #[test]
