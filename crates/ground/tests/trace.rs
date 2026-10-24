@@ -262,10 +262,18 @@ fn the_trace_ends_when_the_root_exits_and_kills_what_it_left_running() {
         .trim()
         .parse()
         .unwrap();
-    assert!(
-        !Path::new(&format!("/proc/{pid}")).exists(),
-        "the leftover process {pid} is still there"
-    );
+    assert!(is_dead(pid), "the leftover process {pid} is still running");
+}
+
+/// Gone, or a zombie waiting for its real parent (init or a subreaper, which
+/// on a CI container may take its time to collect it).
+fn is_dead(pid: u32) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, rest)| rest.starts_with('Z') || rest.starts_with('X')),
+    }
 }
 
 #[test]
