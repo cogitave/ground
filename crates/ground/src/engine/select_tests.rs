@@ -529,3 +529,166 @@ fn not_a_git_checkout_selects_everything_with_nothing_listed() {
     assert!(s.all && s.selected.is_empty());
     assert!(s.all_reason.unwrap().contains("enumerating tests failed"));
 }
+
+// ---- package-level dependency records ----
+
+const ZOD: &str = "zod@3.25.76";
+const CHAI: &str = "chai@5.2.0";
+
+/// pnpm's layout under the fixture: two installed packages, each with a
+/// package.json and a module file.
+fn install(fx: &Fx) {
+    for (dir, name) in [(ZOD, "zod"), (CHAI, "chai")] {
+        let base = format!("node_modules/.pnpm/{dir}/node_modules/{name}");
+        write(&fx.root, &format!("{base}/package.json"), "{}");
+        write(&fx.root, &format!("{base}/index.js"), "1");
+    }
+}
+
+fn dep(dir: &str, name: &str) -> DepEntry {
+    DepEntry {
+        dep: format!("{dir}/{name}"),
+        store: "node_modules/.pnpm".into(),
+    }
+}
+
+/// a.test.ts depends on zod, b.test.ts on chai, both recorded per package.
+fn dep_fixture() -> Fx {
+    let fx = fixture();
+    install(&fx);
+    edit_all(&fx, |m| {
+        m.deps_format = crate::engine::manifest::DEPS_FORMAT;
+        m.deps = vec![if m.test == "a.test.ts" {
+            dep(ZOD, "zod")
+        } else {
+            dep(CHAI, "chai")
+        }];
+    });
+    fx
+}
+
+#[test]
+fn recorded_packages_that_are_still_installed_select_nothing() {
+    let fx = dep_fixture();
+    let s = run(&fx);
+    assert!(!s.all && names(&s).is_empty(), "{s:?}");
+}
+
+#[test]
+fn the_lockfile_is_not_global_once_every_manifest_records_packages() {
+    let fx = dep_fixture();
+    write(&fx.root, "pnpm-lock.yaml", "lock v2");
+    let s = run(&fx);
+    assert!(!s.all && names(&s).is_empty(), "{s:?}");
+    // Other globals still are.
+    write(&fx.root, "pnpm-workspace.yaml", "packages: []");
+    assert!(all_reason(&run(&fx)).contains("pnpm-workspace.yaml"));
+}
+
+#[test]
+fn the_lockfile_stays_global_for_a_manifest_without_package_records() {
+    let fx = dep_fixture();
+    edit_all(&fx, |m| {
+        if m.test == "b.test.ts" {
+            m.deps_format = 0;
+            m.deps.clear();
+        }
+    });
+    write(&fx.root, "pnpm-lock.yaml", "lock v2");
+    assert!(all_reason(&run(&fx)).contains("pnpm-lock.yaml"));
+}
+
+#[test]
+fn a_test_that_read_the_lockfile_itself_is_selected_by_its_hash() {
+    let fx = dep_fixture();
+    write(&fx.root, "pnpm-lock.yaml", "lock v1");
+    git(&fx.root, &["add", "pnpm-lock.yaml"]);
+    git(&fx.root, &["commit", "-qm", "lock"]);
+    edit_all(&fx, |m| {
+        m.commit = Some(head(&fx.root));
+        if m.test == "b.test.ts" {
+            m.files.push(FileEntry::file(
+                "pnpm-lock.yaml",
+                h(&fx.root, "pnpm-lock.yaml"),
+            ));
+        }
+    });
+    assert!(names(&run(&fx)).is_empty());
+    write(&fx.root, "pnpm-lock.yaml", "lock v2");
+    let s = run(&fx);
+    assert!(!s.all, "{s:?}");
+    assert_eq!(names(&s), ["b.test.ts"]);
+    assert_eq!(s.selected[0].reasons, ["input changed: pnpm-lock.yaml"]);
+}
+
+#[test]
+fn a_package_directory_that_is_gone_selects_only_its_dependents() {
+    let fx = dep_fixture();
+    // zod moved to another version: the recorded directory no longer exists.
+    fs::remove_dir_all(fx.root.join(format!("node_modules/.pnpm/{ZOD}"))).unwrap();
+    write(
+        &fx.root,
+        "node_modules/.pnpm/zod@3.25.77/node_modules/zod/package.json",
+        "{}",
+    );
+    write(&fx.root, "pnpm-lock.yaml", "lock v2");
+    let s = run(&fx);
+    assert!(!s.all);
+    assert_eq!(names(&s), ["a.test.ts"]);
+    assert_eq!(
+        s.selected[0].reasons,
+        [format!("dependency not installed: {ZOD}/zod")]
+    );
+}
+
+#[test]
+fn a_package_directory_replaced_by_a_file_or_a_link_or_emptied_selects() {
+    let fx = dep_fixture();
+    let zod = fx
+        .root
+        .join(format!("node_modules/.pnpm/{ZOD}/node_modules/zod"));
+    fs::remove_dir_all(&zod).unwrap();
+    fs::write(&zod, "not a directory").unwrap();
+    assert_eq!(names(&run(&fx)), ["a.test.ts"]);
+    fs::remove_file(&zod).unwrap();
+    std::os::unix::fs::symlink("../../chai@5.2.0/node_modules/chai", &zod).unwrap();
+    assert_eq!(names(&run(&fx)), ["a.test.ts"]);
+    fs::remove_file(&zod).unwrap();
+    fs::create_dir(&zod).unwrap(); // present but holding no package.json
+    assert_eq!(names(&run(&fx)), ["a.test.ts"]);
+}
+
+#[test]
+fn no_node_modules_at_all_selects_everything() {
+    let fx = dep_fixture();
+    fs::remove_dir_all(fx.root.join("node_modules")).unwrap();
+    let r = all_reason(&run(&fx));
+    assert!(r.contains("installed packages unreadable"), "{r}");
+}
+
+#[test]
+fn package_changes_inside_a_recorded_directory_are_not_looked_for() {
+    // The directory name pins name, version and peers; pnpm checks integrity.
+    let fx = dep_fixture();
+    write(
+        &fx.root,
+        &format!("node_modules/.pnpm/{ZOD}/node_modules/zod/index.js"),
+        "edited by hand",
+    );
+    assert!(names(&run(&fx)).is_empty());
+}
+
+#[test]
+fn a_manifest_of_the_old_format_still_checks_every_node_modules_file() {
+    let fx = fixture();
+    install(&fx);
+    let f = format!("node_modules/.pnpm/{ZOD}/node_modules/zod/index.js");
+    edit_all(&fx, |m| {
+        if m.test == "a.test.ts" {
+            m.files.push(FileEntry::file(&f, h(&fx.root, &f)));
+        }
+    });
+    assert!(names(&run(&fx)).is_empty());
+    write(&fx.root, &f, "2");
+    assert_eq!(names(&run(&fx)), ["a.test.ts"]);
+}
