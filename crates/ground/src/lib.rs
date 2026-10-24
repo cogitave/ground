@@ -3,11 +3,15 @@
 //! The ports (`ports`) are the seam every lane is written against; `adapters`
 //! hold the real implementations and `testing` the fakes.
 
+// `unsafe` is confined to `engine::trace::sys` (ptrace, fork, seccomp).
+#![deny(unsafe_code)]
+
 pub mod adapters;
 pub mod approval;
 pub mod cli;
 pub mod config;
 pub mod daemon;
+pub mod engine;
 pub mod lanes;
 pub mod ports;
 pub mod state;

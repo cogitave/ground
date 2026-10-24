@@ -4,8 +4,10 @@ use std::path::Path;
 use clap::{Args, Parser, Subcommand};
 
 use super::doctor::{default_checks, format_report, run_checks};
+use super::engine::{ManifestsCommand, SelectArgs, cmd_manifests, cmd_select};
 use super::install_service::{InstallServiceOptions, built_daemon_entry, install_service};
 use super::status::{format_status, summaries};
+use super::trace::{TraceArgs, cmd_trace};
 use crate::adapters::{NpmRegistry, RestGitHub, SystemClock};
 use crate::config::RepoConfig;
 use crate::daemon::{ConsoleLogger, db_path, ground_home_from_env, load_repos, run_daemon};
@@ -18,6 +20,12 @@ pub const USAGE: &str = "usage: ground <command>
   ship <repo> [--confirm] [--json]
                                 walk a version PR to npm; dry run unless --confirm
   daemon                        run groundd in the foreground
+  select --base <ref> [--manifests <dir>] [--root <dir>] [--format json|lines|vitest]
+         [--global <glob>...] [--always <glob>...]
+                                print the tests a change requires
+  manifests import <dir>        copy trace manifests into the store
+  trace [--root <dir>] [--out <file>] [--test <path>] -- <command...>
+                                run a command and record the files it reads
   doctor                        check the setup
   install-service               write the systemd user unit (does not enable it)
 ";
@@ -44,6 +52,13 @@ pub enum Command {
     },
     /// Walk a version PR to npm; dry run unless --confirm
     Ship(ShipArgs),
+    /// Print the tests a change requires
+    Select(SelectArgs),
+    /// Manage trace manifests
+    #[command(subcommand)]
+    Manifests(ManifestsCommand),
+    /// Run a command and record the files its process tree reads
+    Trace(TraceArgs),
     /// Run groundd in the foreground
     Daemon,
     /// Check the setup
@@ -149,6 +164,9 @@ pub async fn run_cli(cli: Cli) -> i32 {
         }
         Some(Command::Status { repo, json }) => cmd_status(&home, repo, json).await,
         Some(Command::Ship(args)) => cmd_ship(&home, args).await,
+        Some(Command::Select(args)) => cmd_select(&home, args),
+        Some(Command::Manifests(cmd)) => cmd_manifests(&home, cmd),
+        Some(Command::Trace(args)) => cmd_trace(args),
         Some(Command::Daemon) => {
             let env: HashMap<String, String> = std::env::vars().collect();
             Ok(run_daemon(&env).await)
