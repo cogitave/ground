@@ -2,6 +2,7 @@
 //! selection.
 
 pub mod manifest;
+pub mod runner;
 pub mod select;
 pub mod store;
 pub mod trace;

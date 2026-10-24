@@ -9,7 +9,9 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::manifest::{FileEntry, MANIFEST_VERSION, Manifest};
+use crate::engine::manifest::{DEPS_FORMAT, DepEntry, FileEntry, MANIFEST_VERSION, Manifest};
+
+use super::deps;
 
 /// How the traced tree touched a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +52,13 @@ pub struct TraceManifest {
     /// minus those whose first access was a write. A directory that was
     /// opened is hashed over its sorted entry names.
     pub files: Vec<FileEntry>,
+    /// Installed packages read from (pnpm's content-addressed layout), one per
+    /// package directory instead of one per file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deps: Vec<DepEntry>,
+    /// The layout version of `deps` ([`DEPS_FORMAT`]).
+    #[serde(default)]
+    pub deps_format: u32,
     /// Paths under `root` probed and not found.
     pub absent: Vec<String>,
     /// Resolved executables of every exec.
@@ -81,6 +90,8 @@ impl TraceManifest {
             exit_code: self.exit_code,
             test,
             files: self.files,
+            deps: self.deps,
+            deps_format: self.deps_format,
             absent: self.absent,
             exec: self.exec,
             toolchain: self.toolchain,
@@ -272,7 +283,7 @@ impl Recorder {
         }
         // A tool's own cache is rewritten by every run (vitest's results file
         // holds durations), so its end-of-run hash can never match a later one.
-        if is_tool_cache(&rel) {
+        if is_tool_cache(&rel) || deps::is_installer_state(&rel) {
             return;
         }
         // A probe of an existing directory (every ancestor gets stat'ed during
@@ -319,6 +330,8 @@ impl Recorder {
     pub fn finish(self, command: Vec<String>, exit_code: i32) -> TraceManifest {
         let mut files: BTreeMap<(String, bool), String> = BTreeMap::new();
         let mut absent = BTreeSet::new();
+        let mut dep_set = BTreeSet::new();
+        let mut manifests_to_pin = BTreeSet::new();
         for (rel, seen) in &self.seen {
             let abs = self.root.join(rel);
             match seen.class {
@@ -327,6 +340,26 @@ impl Recorder {
                     absent.insert(to_slash(rel));
                 }
                 First::Input => {
+                    // A file inside an installed package whose directory name
+                    // pins its content is recorded as the package, unhashed.
+                    if let Some(dep) = deps::pnpm_dep(rel) {
+                        dep_set.insert(dep);
+                        continue;
+                    }
+                    // The same through a symlink to the package: the link's
+                    // target text stays recorded, so a retarget is seen.
+                    if let Some((link, dep)) = deps::pnpm_link_dep(&self.root, rel) {
+                        let hash =
+                            hash_link(&self.root.join(&link)).unwrap_or_else(|| MISSING.into());
+                        files.insert((to_slash(&link), true), hash);
+                        dep_set.insert(dep);
+                        continue;
+                    }
+                    if seen.content.is_some()
+                        && let Some(pj) = deps::package_json_of(rel)
+                    {
+                        manifests_to_pin.insert(pj);
+                    }
                     if let Some(snap) = &seen.content {
                         files.insert((to_slash(rel), false), settle(snap, &abs));
                     }
@@ -341,6 +374,20 @@ impl Recorder {
                 }
             }
         }
+        // Any other installed package: its package.json (name and version) is
+        // pinned beside the files that were read.
+        for pj in manifests_to_pin {
+            if !files.contains_key(&(pj.clone(), false))
+                && let Some(h) = hash_path(&self.root.join(&pj))
+            {
+                files.insert((pj, false), h);
+            }
+        }
+        // Probes of paths inside a recorded package say nothing its name does
+        // not: the same version has the same files.
+        let deps: Vec<DepEntry> = dep_set.into_iter().collect();
+        let dep_dirs: Vec<String> = deps.iter().map(|d| format!("{}/", d.path())).collect();
+        absent.retain(|a| !dep_dirs.iter().any(|d| a.starts_with(d.as_str())));
         let toolchain = self
             .exec
             .iter()
@@ -363,6 +410,8 @@ impl Recorder {
                 .into_iter()
                 .map(|((path, link), blake3)| FileEntry { path, blake3, link })
                 .collect(),
+            deps,
+            deps_format: DEPS_FORMAT,
             absent: absent.into_iter().collect(),
             exec: self.exec.into_iter().collect(),
             toolchain,
@@ -635,6 +684,150 @@ mod tests {
         }
         let m = r.finish(vec![], 0);
         assert!(m.files.is_empty() && m.absent.is_empty());
+    }
+
+    fn touch(root: &Path, rel: &str, body: &str) {
+        let p = root.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, body).unwrap();
+    }
+
+    #[test]
+    fn files_of_a_pnpm_package_collapse_to_one_package_record() {
+        let (_d, root) = setup();
+        let pkg = "node_modules/.pnpm/zod@3.25.76/node_modules/zod";
+        touch(&root, &format!("{pkg}/package.json"), "{}");
+        touch(&root, &format!("{pkg}/dist/a.js"), "a");
+        touch(&root, &format!("{pkg}/dist/b.js"), "b");
+        let mut r = Recorder::new(&root);
+        for f in ["package.json", "dist/a.js", "dist/b.js"] {
+            r.record(&acc(&root.join(pkg).join(f), AccessKind::Read, true, false));
+        }
+        // A probe inside the package that found nothing: same version, same files.
+        r.record(&acc(
+            &root.join(pkg).join("nope.js"),
+            AccessKind::Probe,
+            false,
+            false,
+        ));
+        let m = r.finish(vec![], 0);
+        assert!(m.files.is_empty(), "{:?}", m.files);
+        assert!(m.absent.is_empty(), "{:?}", m.absent);
+        assert_eq!(m.deps.len(), 1);
+        assert_eq!(m.deps[0].dep, "zod@3.25.76/zod");
+        assert_eq!(m.deps[0].store, "node_modules/.pnpm");
+        assert_eq!(m.deps_format, DEPS_FORMAT);
+    }
+
+    #[test]
+    fn a_read_through_a_dependency_link_keeps_the_link_and_records_the_package() {
+        let (_d, root) = setup();
+        let entry = "node_modules/.pnpm/vitest@4.1.11/node_modules";
+        touch(
+            &root,
+            "node_modules/.pnpm/chai@5.2.0/node_modules/chai/package.json",
+            "{}",
+        );
+        touch(
+            &root,
+            "node_modules/.pnpm/chai@5.2.0/node_modules/chai/index.js",
+            "x",
+        );
+        fs::create_dir_all(root.join(entry)).unwrap();
+        std::os::unix::fs::symlink(
+            "../../chai@5.2.0/node_modules/chai",
+            root.join(entry).join("chai"),
+        )
+        .unwrap();
+        let mut r = Recorder::new(&root);
+        r.record(&lnk(&root.join(entry).join("chai"), true));
+        r.record(&acc(
+            &root.join(entry).join("chai/index.js"),
+            AccessKind::Read,
+            true,
+            false,
+        ));
+        let m = r.finish(vec![], 0);
+        assert_eq!(m.deps.len(), 1);
+        assert_eq!(m.deps[0].dep, "chai@5.2.0/chai");
+        assert_eq!(m.files.len(), 1, "{:?}", m.files);
+        assert!(m.files[0].link && m.files[0].path.ends_with("vitest@4.1.11/node_modules/chai"));
+    }
+
+    #[test]
+    fn a_link_that_is_not_a_package_stays_a_per_file_record() {
+        let (_d, root) = setup();
+        touch(&root, "src/x.js", "x");
+        fs::create_dir_all(root.join("pkg/node_modules")).unwrap();
+        std::os::unix::fs::symlink("../../src", root.join("pkg/node_modules/loose")).unwrap();
+        let mut r = Recorder::new(&root);
+        r.record(&acc(
+            &root.join("pkg/node_modules/loose/x.js"),
+            AccessKind::Read,
+            true,
+            false,
+        ));
+        let m = r.finish(vec![], 0);
+        assert!(m.deps.is_empty());
+        assert!(
+            m.files
+                .iter()
+                .any(|f| f.path == "pkg/node_modules/loose/x.js")
+        );
+    }
+
+    #[test]
+    fn another_layout_keeps_its_files_and_gains_the_package_json() {
+        let (_d, root) = setup();
+        touch(
+            &root,
+            "node_modules/left-pad/package.json",
+            "{\"version\":\"1.3.0\"}",
+        );
+        touch(&root, "node_modules/left-pad/index.js", "x");
+        touch(&root, "node_modules/@s/p/package.json", "{}");
+        touch(&root, "node_modules/@s/p/lib/x.js", "x");
+        let mut r = Recorder::new(&root);
+        r.record(&acc(
+            &root.join("node_modules/left-pad/index.js"),
+            AccessKind::Read,
+            true,
+            false,
+        ));
+        r.record(&acc(
+            &root.join("node_modules/@s/p/lib/x.js"),
+            AccessKind::Read,
+            true,
+            false,
+        ));
+        let m = r.finish(vec![], 0);
+        let paths: Vec<_> = m.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "node_modules/@s/p/lib/x.js",
+                "node_modules/@s/p/package.json",
+                "node_modules/left-pad/index.js",
+                "node_modules/left-pad/package.json"
+            ]
+        );
+        assert!(m.deps.is_empty());
+    }
+
+    #[test]
+    fn the_installers_own_state_files_are_not_inputs() {
+        let (_d, root) = setup();
+        touch(&root, "node_modules/.modules.yaml", "prunedAt: now");
+        touch(&root, "node_modules/.pnpm-workspace-state-v1.json", "{}");
+        let mut r = Recorder::new(&root);
+        for f in [
+            "node_modules/.modules.yaml",
+            "node_modules/.pnpm-workspace-state-v1.json",
+        ] {
+            r.record(&acc(&root.join(f), AccessKind::Read, true, false));
+        }
+        let m = r.finish(vec![], 0);
+        assert!(m.files.is_empty() && m.deps.is_empty());
     }
 
     #[test]

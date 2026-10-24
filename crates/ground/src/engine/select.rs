@@ -10,7 +10,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 use super::ENGINE_VERSION;
-use super::manifest::{FileEntry, Manifest, normalize_path};
+use super::manifest::{DEPS_FORMAT, DepEntry, FileEntry, Manifest, normalize_path};
 use super::store::ManifestStore;
 
 /// Changes to any of these select every test.
@@ -31,6 +31,11 @@ pub const DEFAULT_GLOBAL: &[&str] = &[
     "**/vite.config.*",
     ".github/workflows/**",
 ];
+
+/// The lockfile glob that stops being global once every manifest records the
+/// installed packages it read: install state is then checked package by
+/// package, and a test that reads the lockfile itself has it as an input.
+const RELAXED_LOCKFILE: &str = "**/pnpm-lock.yaml";
 
 /// What counts as a test file when enumerating the repository.
 pub const DEFAULT_TESTS: &[&str] = &[
@@ -309,10 +314,6 @@ pub fn select(opts: &SelectOptions) -> Selection {
             );
         }
     };
-    let global = match globset(&opts.global) {
-        Ok(g) => g,
-        Err(e) => return everything(&opts.base, tests, e, true),
-    };
     let always = match globset(&opts.always) {
         Ok(g) => g,
         Err(e) => return everything(&opts.base, tests, e, true),
@@ -343,6 +344,23 @@ pub fn select(opts: &SelectOptions) -> Selection {
     if let Some(reason) = manifest_level_reason(&relevant) {
         return everything(&opts.base, tests, reason, true);
     }
+
+    // The lockfile is global unless every manifest records installed packages
+    // (a manifest written before that existed lists node_modules files only,
+    // and a lockfile change then has no other way in). With no manifest at all
+    // every test is selected anyway.
+    let packages_recorded =
+        !relevant.is_empty() && relevant.iter().all(|m| m.deps_format >= DEPS_FORMAT);
+    let global_patterns: Vec<String> = opts
+        .global
+        .iter()
+        .filter(|g| !(packages_recorded && g.as_str() == RELAXED_LOCKFILE))
+        .cloned()
+        .collect();
+    let global = match globset(&global_patterns) {
+        Ok(g) => g,
+        Err(e) => return everything(&opts.base, tests, e, true),
+    };
 
     // Global inputs are diffed from the commits the manifests were traced at
     // as well as from the base: a lockfile that landed on the base after they
@@ -411,6 +429,14 @@ pub fn select(opts: &SelectOptions) -> Selection {
         }
     }
 
+    // Installed packages: each recorded one must still be there. If the
+    // install they were read from is gone or unreadable altogether nothing can
+    // be trusted (the lockfile may not be global any more), so everything runs.
+    let installed = match installed_packages(root, &relevant) {
+        Ok(i) => i,
+        Err(reason) => return everything(&opts.base, tests, reason, true),
+    };
+
     // A test file the runner may run that the globs do not list can never be
     // selected by its own manifest; a new one means we cannot know.
     if !opts.tests_declared {
@@ -458,6 +484,18 @@ pub fn select(opts: &SelectOptions) -> Selection {
                 }
                 reasons.extend(input_reasons.into_values().take(MAX_INPUT_REASONS));
                 reasons.extend(
+                    m.deps
+                        .iter()
+                        .filter(|d| {
+                            !installed
+                                .get(&dep_path(root, m, d))
+                                .copied()
+                                .unwrap_or(false)
+                        })
+                        .take(MAX_INPUT_REASONS)
+                        .map(|d| format!("dependency not installed: {}", d.dep)),
+                );
+                reasons.extend(
                     m.absent
                         .iter()
                         .filter(|a| exists_now(&resolve(root, &m.root, a)))
@@ -488,6 +526,44 @@ pub fn select(opts: &SelectOptions) -> Selection {
         selected,
         counts,
     }
+}
+
+fn dep_path(root: &Path, m: &Manifest, d: &DepEntry) -> PathBuf {
+    resolve(root, &m.root, &d.path())
+}
+
+/// Whether each distinct package the manifests recorded is installed now: a
+/// real directory (not a link, not a file) holding a `package.json`. `Err`
+/// when a virtual store a manifest recorded cannot be listed (no install, or
+/// no right to look), which fails closed to selecting everything.
+fn installed_packages(
+    root: &Path,
+    manifests: &[&Manifest],
+) -> Result<HashMap<PathBuf, bool>, String> {
+    let mut stores = BTreeSet::new();
+    let mut deps = BTreeSet::new();
+    for m in manifests {
+        for d in &m.deps {
+            stores.insert(resolve(root, &m.root, &d.store));
+            deps.insert(dep_path(root, m, d));
+        }
+    }
+    for s in &stores {
+        if let Err(e) = std::fs::read_dir(s) {
+            return Err(format!(
+                "installed packages unreadable ({}: {e}); install dependencies first",
+                s.display()
+            ));
+        }
+    }
+    Ok(deps
+        .into_iter()
+        .map(|p| {
+            let dir = std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir());
+            let ok = dir && std::fs::metadata(p.join("package.json")).is_ok_and(|m| m.is_file());
+            (p, ok)
+        })
+        .collect())
 }
 
 /// What the manifests alone say makes every one of them untrustworthy: an

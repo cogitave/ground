@@ -8,6 +8,7 @@ use super::engine::{ManifestsCommand, SelectArgs, cmd_manifests, cmd_select};
 use super::install_service::{InstallServiceOptions, built_daemon_entry, install_service};
 use super::status::{format_status, summaries};
 use super::trace::{TraceArgs, cmd_trace};
+use super::trace_tests::{TraceTestsArgs, cmd_trace_tests};
 use crate::adapters::{NpmRegistry, RestGitHub, SystemClock};
 use crate::config::RepoConfig;
 use crate::daemon::{ConsoleLogger, db_path, ground_home_from_env, load_repos, run_daemon};
@@ -26,6 +27,9 @@ pub const USAGE: &str = "usage: ground <command>
   manifests import <dir>        copy trace manifests into the store
   trace [--root <dir>] [--out <file>] [--test <path>] -- <command...>
                                 run a command and record the files it reads
+  trace-tests --runner vitest --package <dir> [--jobs N] [--out <dir>] [--filter <glob>]
+              [-- <wrapper...>]
+                                trace each test file of a package, no runner discovery
   doctor                        check the setup
   install-service               write the systemd user unit (does not enable it)
 ";
@@ -59,6 +63,8 @@ pub enum Command {
     Manifests(ManifestsCommand),
     /// Run a command and record the files its process tree reads
     Trace(TraceArgs),
+    /// Trace every test file of a package, one manifest each, without runner discovery
+    TraceTests(TraceTestsArgs),
     /// Run groundd in the foreground
     Daemon,
     /// Check the setup
@@ -167,6 +173,7 @@ pub async fn run_cli(cli: Cli) -> i32 {
         Some(Command::Select(args)) => cmd_select(&home, args),
         Some(Command::Manifests(cmd)) => cmd_manifests(&home, cmd),
         Some(Command::Trace(args)) => cmd_trace(args),
+        Some(Command::TraceTests(args)) => cmd_trace_tests(&home, args),
         Some(Command::Daemon) => {
             let env: HashMap<String, String> = std::env::vars().collect();
             Ok(run_daemon(&env).await)

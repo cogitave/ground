@@ -65,6 +65,11 @@ impl ManifestStore {
         &self.dir
     }
 
+    /// Where the manifest of `test` is (or would be) stored.
+    pub fn path_of(&self, test: &str) -> PathBuf {
+        self.dir.join(file_name(test))
+    }
+
     pub fn put(&self, m: &Manifest) -> Result<(), StoreError> {
         fs::create_dir_all(&self.dir)
             .map_err(|e| StoreError::Io(self.dir.clone(), e.to_string()))?;
@@ -72,8 +77,8 @@ impl ManifestStore {
         m.test = normalize_path(&m.test);
         let path = self.dir.join(file_name(&m.test));
         let tmp = path.with_extension("json.tmp");
-        let bytes = serde_json::to_vec_pretty(&m)
-            .map_err(|e| StoreError::Io(path.clone(), e.to_string()))?;
+        let bytes =
+            serde_json::to_vec(&m).map_err(|e| StoreError::Io(path.clone(), e.to_string()))?;
         fs::write(&tmp, bytes)
             .and_then(|_| fs::rename(&tmp, &path))
             .map_err(|e| StoreError::Io(path, e.to_string()))
@@ -144,6 +149,8 @@ mod tests {
             exit_code: 0,
             test: test.into(),
             files: vec![],
+            deps: vec![],
+            deps_format: 0,
             absent: vec![],
             exec: vec![],
             toolchain: vec![],

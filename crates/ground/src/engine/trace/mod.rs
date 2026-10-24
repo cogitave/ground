@@ -12,6 +12,7 @@
 //! setuid binaries do not elevate (the filter needs `no_new_privs`). On any
 //! other platform, or when the trace fails, the caller must select everything.
 
+mod deps;
 mod record;
 #[cfg(all(
     target_os = "linux",

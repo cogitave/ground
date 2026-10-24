@@ -88,6 +88,8 @@ fn manifest(fx: &Fx, test: &str, files: &[&str], absent: &[&str]) {
             .iter()
             .map(|f| FileEntry::file(*f, h(&fx.root, f)))
             .collect(),
+        deps: vec![],
+        deps_format: 0,
         absent: absent.iter().map(|s| (*s).to_owned()).collect(),
         exec: vec!["bin/tool".into()],
         toolchain: vec![FileEntry::file("bin/tool", h(&fx.root, "bin/tool"))],
@@ -411,6 +413,8 @@ fn a_lockfile_above_a_package_root_is_still_global() {
         exit_code: 0,
         test: "a.test.ts".into(),
         files: vec![FileEntry::file("a.test.ts", h(&pkg, "a.test.ts"))],
+        deps: vec![],
+        deps_format: 0,
         absent: vec![],
         exec: vec!["tool".into()],
         toolchain: vec![FileEntry::file("tool", h(&pkg, "tool"))],

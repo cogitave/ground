@@ -6,6 +6,7 @@ mod install_service;
 mod run;
 mod status;
 mod trace;
+mod trace_tests;
 
 pub use doctor::{
     Check, CheckResult, DoctorReport, DoctorRow, DoctorStatus, default_checks, format_report,
@@ -18,3 +19,4 @@ pub use install_service::{
 pub use run::{Cli, Command, USAGE, run_cli};
 pub use status::{format_status, summaries};
 pub use trace::{TraceArgs, cmd_trace};
+pub use trace_tests::{TraceTestsArgs, cmd_trace_tests};

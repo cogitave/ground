@@ -20,6 +20,13 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// The manifest layout that records installed packages as [`DepEntry`].
+pub const DEPS_FORMAT: u32 = 1;
+
 impl FileEntry {
     pub fn file(path: impl Into<String>, blake3: impl Into<String>) -> Self {
         Self {
@@ -27,6 +34,34 @@ impl FileEntry {
             blake3: blake3.into(),
             link: false,
         }
+    }
+}
+
+/// One installed package the test read from, recorded as the package rather
+/// than as every file read from it. Only a layout whose directory name pins
+/// the package's identity is collapsed this way (pnpm's virtual store:
+/// `.pnpm/<name>@<version>[_<peers>]/node_modules/<name>`, which pnpm
+/// verifies against the lockfile's integrity), so the directory being
+/// present is the same fact as every file in it being unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DepEntry {
+    /// `<virtual-store directory name>/<package name>`, e.g.
+    /// `vite@8.3.1_@types+node@22.19.17/vite`.
+    pub dep: String,
+    /// The virtual store (`.../node_modules/.pnpm`), relative to the
+    /// manifest's root.
+    pub store: String,
+}
+
+impl DepEntry {
+    /// The package directory, relative to the manifest's root.
+    pub fn path(&self) -> String {
+        let (dir, name) = self.dep.split_once('/').unwrap_or((&self.dep, ""));
+        let mut p = format!("{}/{dir}/node_modules/{name}", self.store);
+        if name.is_empty() {
+            p = format!("{}/{dir}", self.store);
+        }
+        p
     }
 }
 
@@ -42,6 +77,16 @@ pub struct Manifest {
     /// Repo-relative path of the test file this manifest belongs to.
     pub test: String,
     pub files: Vec<FileEntry>,
+    /// Installed packages read from, one per package directory (see
+    /// [`DepEntry`]); their files are not repeated in `files`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deps: Vec<DepEntry>,
+    /// `0` for a manifest written before package-level records existed (it
+    /// lists every `node_modules` file it read, and the lockfile stays a
+    /// global input); [`DEPS_FORMAT`] once it records installed packages as
+    /// [`DepEntry`] values.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub deps_format: u32,
     /// Paths probed and not found; one appearing invalidates the manifest.
     #[serde(default)]
     pub absent: Vec<String>,
@@ -103,6 +148,7 @@ mod tests {
         .unwrap();
         assert!(m.absent.is_empty() && m.exec.is_empty() && m.engine.is_none());
         assert!(m.toolchain.is_empty() && m.env.is_empty() && m.commit.is_none());
+        assert!(m.deps.is_empty() && m.deps_format == 0);
     }
 
     #[test]
