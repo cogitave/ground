@@ -730,3 +730,237 @@ fn a_manifest_of_the_old_format_still_checks_every_node_modules_file() {
     write(&fx.root, &f, "2");
     assert_eq!(names(&run(&fx)), ["a.test.ts"]);
 }
+
+/// Two packages, a/ and b/, each with a test and one source file.
+fn pkgs_fixture() -> Fx {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("repo");
+    fs::create_dir(&root).unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    for p in ["a", "b"] {
+        write(&root, &format!("{p}/{p}.test.ts"), p);
+        write(&root, &format!("{p}/src/{p}.ts"), "1");
+    }
+    write(&root, "bin/tool", "tool1");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-q", "-m", "init"]);
+    git(&root, &["branch", "base"]);
+    let mdir = d.path().join("manifests");
+    let fx = Fx { _d: d, root, mdir };
+    for p in ["a", "b"] {
+        manifest(
+            &fx,
+            &format!("{p}/{p}.test.ts"),
+            &[&format!("{p}/{p}.test.ts"), &format!("{p}/src/{p}.ts")],
+            &[],
+        );
+    }
+    fx
+}
+
+#[test]
+fn a_tsconfig_in_another_directory_selects_only_tests_that_read_under_it() {
+    let fx = pkgs_fixture();
+    write(&fx.root, "b/tsconfig.json", "{}");
+    let s = run(&fx);
+    assert!(!s.all);
+    assert_eq!(names(&s), ["b/b.test.ts"]);
+    assert_eq!(
+        s.selected[0].reasons,
+        ["config changed in a directory it read from: b/tsconfig.json"]
+    );
+}
+
+#[test]
+fn a_scoped_config_nobody_read_under_selects_nothing() {
+    let fx = pkgs_fixture();
+    write(&fx.root, "c/vite.config.ts", "x");
+    let s = run(&fx);
+    assert!(!s.all);
+    assert!(names(&s).is_empty());
+}
+
+#[test]
+fn a_tsconfig_or_vite_config_at_the_root_selects_everything() {
+    for f in ["tsconfig.json", "vite.config.ts"] {
+        let fx = pkgs_fixture();
+        write(&fx.root, f, "{}");
+        let r = all_reason(&run(&fx));
+        assert!(r.starts_with("config at or above the root changed:"), "{r}");
+        assert!(r.contains(f), "{r}");
+    }
+}
+
+#[test]
+fn a_config_above_or_beside_a_subdirectory_root_selects_everything() {
+    let d = tempfile::tempdir().unwrap();
+    let top = d.path().join("repo");
+    let pkg = top.join("pkg");
+    fs::create_dir_all(&pkg).unwrap();
+    git(&top, &["init", "-q", "-b", "main"]);
+    write(&pkg, "a.test.ts", "a");
+    write(&pkg, "tool", "t");
+    git(&top, &["add", "."]);
+    git(&top, &["commit", "-qm", "init"]);
+    git(&top, &["branch", "base"]);
+    let fx = Fx {
+        _d: d,
+        root: pkg.clone(),
+        mdir: top.parent().unwrap().join("manifests"),
+    };
+    let m = Manifest {
+        version: 1,
+        root: pkg.to_string_lossy().into_owned(),
+        command: vec![],
+        exit_code: 0,
+        test: "a.test.ts".into(),
+        files: vec![FileEntry::file("a.test.ts", h(&pkg, "a.test.ts"))],
+        deps: vec![],
+        deps_format: 0,
+        absent: vec![],
+        exec: vec!["tool".into()],
+        toolchain: vec![FileEntry::file("tool", h(&pkg, "tool"))],
+        env: Default::default(),
+        commit: Some(head(&top)),
+        engine: Some(ENGINE_VERSION.into()),
+    };
+    ManifestStore::new(&fx.mdir).put(&m).unwrap();
+    // Outside the root nothing is recorded, so a sibling's config cannot be
+    // scoped to the tests that read under it.
+    write(&top, "other/tsconfig.json", "{}");
+    let r = all_reason(&run(&fx));
+    assert!(r.starts_with("config outside the root changed:"), "{r}");
+    fs::remove_file(top.join("other/tsconfig.json")).unwrap();
+    assert!(!run(&fx).all);
+    write(&top, "tsconfig.json", "{}");
+    let r = all_reason(&run(&fx));
+    assert!(r.starts_with("config at or above the root changed:"), "{r}");
+}
+
+#[test]
+fn a_new_untracked_tsconfig_in_a_scoped_directory_selects_its_tests() {
+    let fx = pkgs_fixture();
+    write(&fx.root, "a/tsconfig.build.json", "{}");
+    let s = run(&fx);
+    assert_eq!(names(&s), ["a/a.test.ts"]);
+}
+
+#[test]
+fn a_deleted_vitest_config_in_a_scoped_directory_selects_its_tests() {
+    let fx = pkgs_fixture();
+    write(&fx.root, "a/vitest.config.ts", "x");
+    git(&fx.root, &["add", "."]);
+    git(&fx.root, &["commit", "-qm", "cfg"]);
+    git(&fx.root, &["branch", "-f", "base"]);
+    manifest(&fx, "a/a.test.ts", &["a/a.test.ts", "a/src/a.ts"], &[]);
+    manifest(&fx, "b/b.test.ts", &["b/b.test.ts", "b/src/b.ts"], &[]);
+    assert!(names(&run(&fx)).is_empty());
+    fs::remove_file(fx.root.join("a/vitest.config.ts")).unwrap();
+    let s = run(&fx);
+    assert!(!s.all);
+    assert_eq!(names(&s), ["a/a.test.ts"]);
+}
+
+/// A fixture where `a/a.test.ts` records one extra path of `kind` under `c/`,
+/// a directory that holds neither test file, so a changed `c/tsconfig.json`
+/// can select it only through that recorded path.
+fn recorded_under_c(kind: &str) -> Fx {
+    let fx = pkgs_fixture();
+    write(&fx.root, "c/src/x.ts", "1");
+    write(&fx.root, "c/tool", "t");
+    write(
+        &fx.root,
+        "c/node_modules/.pnpm/zod@3.0.0/node_modules/zod/package.json",
+        "{}",
+    );
+    git(&fx.root, &["add", "."]);
+    git(&fx.root, &["commit", "-qm", "c"]);
+    git(&fx.root, &["branch", "-f", "base"]);
+    manifest(&fx, "a/a.test.ts", &["a/a.test.ts", "a/src/a.ts"], &[]);
+    manifest(&fx, "b/b.test.ts", &["b/b.test.ts", "b/src/b.ts"], &[]);
+    edit_all(&fx, |m| {
+        if m.test != "a/a.test.ts" {
+            return;
+        }
+        match kind {
+            "files" => m
+                .files
+                .push(FileEntry::file("c/src/x.ts", h(&fx.root, "c/src/x.ts"))),
+            "absent" => m.absent = vec!["c/x.ts".into()],
+            "toolchain" => {
+                m.exec = vec!["c/tool".into()];
+                m.toolchain = vec![FileEntry::file("c/tool", h(&fx.root, "c/tool"))];
+            }
+            "deps" => {
+                m.deps_format = crate::engine::manifest::DEPS_FORMAT;
+                let mut d = DepEntry {
+                    dep: "zod@3.0.0/zod".into(),
+                    store: "c/node_modules/.pnpm".into(),
+                    blake3: String::new(),
+                };
+                d.blake3 = crate::engine::trace::hash_package(&fx.root.join(d.path())).unwrap();
+                m.deps = vec![d];
+            }
+            _ => unreachable!(),
+        }
+    });
+    assert!(names(&run(&fx)).is_empty(), "{kind}: {:?}", run(&fx));
+    fx
+}
+
+#[test]
+fn each_kind_of_recorded_path_under_the_directory_is_enough() {
+    for kind in ["files", "absent", "deps", "toolchain"] {
+        let fx = recorded_under_c(kind);
+        write(&fx.root, "c/tsconfig.json", "{}");
+        let s = run(&fx);
+        assert!(!s.all, "{kind}: {s:?}");
+        assert_eq!(names(&s), ["a/a.test.ts"], "{kind}");
+        assert_eq!(
+            s.selected[0].reasons,
+            ["config changed in a directory it read from: c/tsconfig.json"],
+            "{kind}"
+        );
+    }
+}
+
+#[test]
+fn the_test_file_itself_under_the_directory_is_enough() {
+    let fx = pkgs_fixture();
+    edit_all(&fx, |m| m.files.clear());
+    write(&fx.root, "a/tsconfig.json", "{}");
+    assert_eq!(names(&run(&fx)), ["a/a.test.ts"]);
+}
+
+#[test]
+fn listing_a_scoped_glob_as_global_keeps_it_fully_global() {
+    let fx = pkgs_fixture();
+    write(&fx.root, "b/tsconfig.json", "{}");
+    let mut o = SelectOptions::new(fx.root.clone(), "base".into(), fx.mdir.clone());
+    o.global.push("**/tsconfig*.json".into());
+    let s = select(&o);
+    assert!(all_reason(&s).starts_with("global input changed"));
+}
+
+#[test]
+fn a_custom_scoped_glob_applies() {
+    let fx = pkgs_fixture();
+    write(&fx.root, "a/jest.config.js", "x");
+    assert!(names(&run(&fx)).is_empty());
+    let mut o = SelectOptions::new(fx.root.clone(), "base".into(), fx.mdir.clone());
+    o.scoped.push("**/jest.config.*".into());
+    let s = select(&o);
+    assert!(!s.all);
+    assert_eq!(names(&s), ["a/a.test.ts"]);
+}
+
+#[test]
+fn a_scoped_config_under_a_symlinked_alias_of_the_root_is_found() {
+    let fx = pkgs_fixture();
+    let alias = fx.root.parent().unwrap().join("alias");
+    std::os::unix::fs::symlink(&fx.root, &alias).unwrap();
+    write(&fx.root, "b/tsconfig.json", "{}");
+    let s = select(&SelectOptions::new(alias, "base".into(), fx.mdir.clone()));
+    assert!(!s.all);
+    assert_eq!(names(&s), ["b/b.test.ts"]);
+}

@@ -33,6 +33,9 @@ pub struct SelectArgs {
     /// Extra globs whose change selects every test
     #[arg(long, num_args = 1..)]
     pub global: Vec<String>,
+    /// Extra globs whose change selects every test that recorded a path in the directory holding them
+    #[arg(long, num_args = 1..)]
+    pub scoped: Vec<String>,
     /// Globs of tests that always run
     #[arg(long, num_args = 1..)]
     pub always: Vec<String>,
@@ -88,22 +91,29 @@ fn root_of(root: Option<PathBuf>) -> Result<PathBuf, String> {
     }
 }
 
-pub fn cmd_select(home: &Path, args: SelectArgs) -> Result<i32, String> {
+fn select_options(home: &Path, args: SelectArgs) -> Result<SelectOptions, String> {
     let root = root_of(args.root)?;
     let manifests = args.manifests.unwrap_or_else(|| default_dir(home, &root));
     let mut opts = SelectOptions::new(root, args.base, manifests);
     opts.lockfile_global = args.global.iter().any(|g| g == RELAXED_LOCKFILE);
     opts.global.extend(args.global);
+    opts.scoped.extend(args.scoped);
     opts.always = args.always;
     if !args.tests.is_empty() {
         opts.tests = args.tests;
         opts.tests_declared = true;
     }
+    Ok(opts)
+}
+
+pub fn cmd_select(home: &Path, args: SelectArgs) -> Result<i32, String> {
+    let format = args.format;
+    let opts = select_options(home, args)?;
     let sel = select(&opts);
     if let Some(reason) = &sel.all_reason {
         eprintln!("ground: selecting everything: {reason}");
     }
-    let text = render(&sel, args.format)?;
+    let text = render(&sel, format)?;
     if !text.is_empty() {
         println!("{text}");
     }
@@ -151,6 +161,32 @@ mod tests {
         }
     }
 
+    fn select_args(dir: &Path) -> SelectArgs {
+        SelectArgs {
+            base: "main".into(),
+            manifests: Some(dir.join("m")),
+            root: Some(dir.to_owned()),
+            format: Format::Vitest,
+            global: vec![],
+            scoped: vec![],
+            always: vec![],
+            tests: vec![],
+        }
+    }
+
+    #[test]
+    fn scoped_globs_reach_the_select_options_beside_the_defaults() {
+        let d = tempfile::tempdir().unwrap();
+        let args = SelectArgs {
+            scoped: vec!["**/jest.config.*".into()],
+            ..select_args(d.path())
+        };
+        let o = select_options(d.path(), args).unwrap();
+        assert!(o.scoped.contains(&"**/jest.config.*".to_owned()));
+        assert!(o.scoped.contains(&"**/tsconfig*.json".to_owned()));
+        assert!(!o.global.contains(&"**/jest.config.*".to_owned()));
+    }
+
     #[test]
     fn vitest_format_is_space_separated_with_an_explicit_empty_marker() {
         assert_eq!(
@@ -183,6 +219,7 @@ mod tests {
                 root: Some(d.path().to_owned()),
                 format: Format::Vitest,
                 global: vec![],
+                scoped: vec![],
                 always: vec![],
                 tests: vec![],
             },

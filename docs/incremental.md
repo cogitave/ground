@@ -56,12 +56,23 @@ coverage-based selection lost a quarter of the suite.
   file itself changed, or when any file in its manifest now hashes differently
   (build outputs are hashed after the build, so a `dist/` file that did not
   change does not select anything). Everything is selected when a global input
-  changed (lockfile, root config, CI workflow, matched against paths relative
-  to the git toplevel, diffed from the base **and** from every commit the
-  manifests were traced at, so a change that landed on the base after they were
-  recorded is seen), when any executed binary hashes differently or is gone,
-  when a declared environment variable now differs, when a manifest records no
-  engine, toolchain or commit, or when the engine version differs.
+  changed (lockfile, CI workflow, matched against paths relative to the git
+  toplevel, diffed from the base **and** from every commit the manifests were
+  traced at, so a change that landed on the base after they were recorded is
+  seen), when a per-directory config (`tsconfig*.json`, `vite.config.*`,
+  `vitest.config.*`, `vitest.workspace.*`; `--scoped <glob>` adds more) at or
+  above the root changed, when any executed binary hashes differently or is
+  gone, when a declared environment variable now differs, when a manifest
+  records no engine, toolchain or commit, or when the engine version differs.
+  A per-directory config below the root is scoped: it selects only the tests
+  that recorded a path under its directory (the test file, an input, an absent
+  path, a package or a toolchain file), because such a config only applies to
+  files under its own directory; a config pulled in from elsewhere is a
+  recorded read and caught by its hash. Added and deleted configs count.
+  A config outside the root (a sibling package when the root is a
+  subdirectory) selects everything: a trace records only paths under the root,
+  so nothing says which tests read there. Listing the glob with `--global`
+  keeps it global.
 - **The lockfile is global only for older manifests.** Once every manifest has
   `deps_format` >= 2, `pnpm-lock.yaml` stops being a global glob: select asks,
   for each recorded package, whether its directory is still installed (a real
@@ -202,7 +213,7 @@ move):
 | now | 33% | 50% | 59% | 5 | 18 |
 
 The 5 left: two bump `packages/sdk/package.json` (every test reads it) and
-three change a `tsconfig` or `vite.config` of another package (still global).
+three change a `tsconfig` or `vite.config` of another package (global then; scoped since, see below).
 The emulation cannot model a lockfile commit that changes a dependency's
 version (the reinstall would replace the package directories and select its
 dependents), so the 7 lockfile commits are optimistic. Real `ground select`

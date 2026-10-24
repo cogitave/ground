@@ -22,7 +22,7 @@ pub const USAGE: &str = "usage: ground <command>
                                 walk a version PR to npm; dry run unless --confirm
   daemon                        run groundd in the foreground
   select --base <ref> [--manifests <dir>] [--root <dir>] [--format json|lines|vitest]
-         [--global <glob>...] [--always <glob>...]
+         [--global <glob>...] [--scoped <glob>...] [--always <glob>...]
                                 print the tests a change requires
   manifests import <dir>        copy trace manifests into the store
   trace [--root <dir>] [--out <file>] [--test <path>] -- <command...>

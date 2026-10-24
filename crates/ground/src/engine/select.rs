@@ -25,11 +25,21 @@ pub const DEFAULT_GLOBAL: &[&str] = &[
     "**/.npmrc",
     "**/.yarnrc.yml",
     "**/bunfig.toml",
+    ".github/workflows/**",
+];
+
+/// Per-directory configs. A change selects every test that recorded a path
+/// under the directory holding the config, not every test. A `tsconfig` is
+/// resolved per transformed file by walking upward from it, and a vite/vitest
+/// config is loaded for the tests run from its directory, so neither can
+/// affect a file outside its own directory; a config pulled in from elsewhere
+/// (`extends`, an import) is a recorded file read and caught by its hash. A
+/// config at or above the root applies to the whole run and selects everything.
+pub const DEFAULT_SCOPED: &[&str] = &[
     "**/tsconfig*.json",
     "**/vitest.config.*",
     "**/vitest.workspace.*",
     "**/vite.config.*",
-    ".github/workflows/**",
 ];
 
 /// The lockfile glob that stops being global once every manifest records the
@@ -58,6 +68,9 @@ pub struct SelectOptions {
     pub base: String,
     pub manifests: PathBuf,
     pub global: Vec<String>,
+    /// Globs of per-directory configs (`DEFAULT_SCOPED`); a glob also listed
+    /// in `global` stays global.
+    pub scoped: Vec<String>,
     pub always: Vec<String>,
     pub tests: Vec<String>,
     /// The caller named the test files itself (`--tests`), so the engine
@@ -78,6 +91,7 @@ impl SelectOptions {
             base,
             manifests,
             global: DEFAULT_GLOBAL.iter().map(|s| (*s).to_owned()).collect(),
+            scoped: DEFAULT_SCOPED.iter().map(|s| (*s).to_owned()).collect(),
             always: vec![],
             tests: DEFAULT_TESTS.iter().map(|s| (*s).to_owned()).collect(),
             tests_declared: false,
@@ -396,6 +410,19 @@ pub fn select(opts: &SelectOptions) -> Selection {
         );
     }
 
+    let scoped = match scoped_configs(opts, &global_patterns, &global_changed, &changed) {
+        Ok((Some(reason), _)) => return everything(&opts.base, tests, reason, true),
+        Ok((None, dirs)) => dirs,
+        Err(e) => {
+            return everything(
+                &opts.base,
+                tests,
+                format!("cannot compute changes: {e}"),
+                true,
+            );
+        }
+    };
+
     // Hash every distinct input and toolchain binary of every manifested test
     // once, in parallel.
     let mut to_hash: BTreeSet<(PathBuf, bool)> = BTreeSet::new();
@@ -475,6 +502,9 @@ pub fn select(opts: &SelectOptions) -> Selection {
                 if changed.contains(t) {
                     reasons.push("test file changed".to_owned());
                 }
+                if !scoped.is_empty() {
+                    reasons.extend(scoped_reasons(root, t, m, &scoped));
+                }
                 let mut input_reasons = BTreeMap::new();
                 for f in &m.files {
                     let key = (f.path.clone(), f.link);
@@ -534,6 +564,129 @@ pub fn select(opts: &SelectOptions) -> Selection {
         selected,
         counts,
     }
+}
+
+/// A changed per-directory config, below the root.
+struct ScopedDir {
+    /// The path as git printed it.
+    config: String,
+    /// The directory holding it, on the canonical base and on the root as given.
+    canon: PathBuf,
+    lexical: PathBuf,
+}
+
+/// First line of a git command's output (the toplevel ends in a newline, not NUL).
+fn git_line(root: &Path, args: &[&str]) -> Result<String, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().next().unwrap_or("").trim_end_matches('\r');
+    if line.is_empty() {
+        return Err(format!("git {}: no output", args.join(" ")));
+    }
+    Ok(line.to_owned())
+}
+
+/// The changed per-directory configs. `Some(reason)` when one sits at or above
+/// the root (it applies to the whole run) or outside it (what tests read there
+/// is not recorded); otherwise the directories below the root that hold one. Any failure to place a path is an `Err` (fail closed).
+fn scoped_configs(
+    opts: &SelectOptions,
+    global_patterns: &[String],
+    global_changed: &BTreeSet<String>,
+    changed: &BTreeSet<String>,
+) -> Result<(Option<String>, Vec<ScopedDir>), String> {
+    // A glob listed as global stays fully global.
+    let patterns: Vec<String> = opts
+        .scoped
+        .iter()
+        .filter(|g| !global_patterns.contains(g))
+        .cloned()
+        .collect();
+    let set = globset(&patterns)?;
+    let from_top: Vec<&String> = global_changed
+        .iter()
+        .filter(|p| set.is_match(p.as_str()))
+        .collect();
+    let from_root: Vec<&String> = changed
+        .iter()
+        .filter(|p| set.is_match(p.as_str()))
+        .collect();
+    if from_top.is_empty() && from_root.is_empty() {
+        return Ok((None, vec![]));
+    }
+    let root = &opts.root;
+    let canon_root = std::fs::canonicalize(root).map_err(|e| format!("{}: {e}", root.display()))?;
+    let canon_top = {
+        let top = git_line(root, &["rev-parse", "--show-toplevel"])?;
+        std::fs::canonicalize(&top).map_err(|e| format!("{top}: {e}"))?
+    };
+    let mut dirs: Vec<ScopedDir> = Vec::new();
+    let mut seen = BTreeSet::new();
+    let sources = [(from_top, &canon_top), (from_root, &canon_root)];
+    for (paths, base) in sources {
+        for p in paths {
+            let rel = Path::new(p.as_str());
+            let dir_rel = rel.parent().unwrap_or_else(|| Path::new(""));
+            let canon = base.join(dir_rel);
+            let file = canon.join(rel.file_name().unwrap_or_default());
+            if canon_root.starts_with(&canon) {
+                return Ok((
+                    Some(format!("config at or above the root changed: {p}")),
+                    vec![],
+                ));
+            }
+            // A trace records only paths under the root, so no manifest can
+            // say whether a test read under a directory outside it.
+            let Ok(below) = canon.strip_prefix(&canon_root) else {
+                return Ok((
+                    Some(format!(
+                        "config outside the root changed: {p} (a trace records only paths under the root)"
+                    )),
+                    vec![],
+                ));
+            };
+            let lexical = root.join(below);
+            if !seen.insert(file) {
+                continue;
+            }
+            dirs.push(ScopedDir {
+                config: p.clone(),
+                canon,
+                lexical,
+            });
+        }
+    }
+    Ok((None, dirs))
+}
+
+/// One reason per changed per-directory config under which the test recorded
+/// any path: its file, an input, an absent path, a package or a toolchain file.
+fn scoped_reasons(root: &Path, test: &str, m: &Manifest, scoped: &[ScopedDir]) -> Vec<String> {
+    let recorded = || {
+        std::iter::once(root.join(test))
+            .chain(m.files.iter().map(|f| resolve(root, &m.root, &f.path)))
+            .chain(m.absent.iter().map(|a| resolve(root, &m.root, a)))
+            .chain(m.deps.iter().map(|d| dep_path(root, m, d)))
+            .chain(m.toolchain.iter().map(|f| resolve(root, &m.root, &f.path)))
+    };
+    scoped
+        .iter()
+        .filter(|s| recorded().any(|p| p.starts_with(&s.canon) || p.starts_with(&s.lexical)))
+        .take(MAX_INPUT_REASONS)
+        .map(|s| format!("config changed in a directory it read from: {}", s.config))
+        .collect()
 }
 
 fn dep_path(root: &Path, m: &Manifest, d: &DepEntry) -> PathBuf {
